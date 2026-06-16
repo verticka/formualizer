@@ -84,6 +84,41 @@ fn infinite_column_sparse_sum_and_count_correct() {
 }
 
 #[test]
+fn index_over_whole_column_resolves_through_full_engine() {
+    // Regression for #151 on the real engine path (arena + resolve_range_view).
+    let wb = TestWorkbook::new();
+    let mut engine = Engine::new(wb, EvalConfig::default());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Int(10))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Int(20))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 3, 1, LiteralValue::Int(30))
+        .unwrap();
+
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=INDEX(A:A,3)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 2, parse("=INDEX($A:$A,3)").unwrap())
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2).unwrap(),
+        LiteralValue::Number(30.0)
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 2).unwrap(),
+        LiteralValue::Number(30.0)
+    );
+}
+
+#[test]
 fn whole_column_includes_far_formula_rows_when_arrow_has_earlier_values() {
     let wb = TestWorkbook::new();
     let cfg = EvalConfig {

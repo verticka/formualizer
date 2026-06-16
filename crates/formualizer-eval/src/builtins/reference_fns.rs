@@ -197,7 +197,11 @@ impl Function for IndexFn {
             None
         };
 
-        // Only Range supported for now
+        // Excel grid limits, used to anchor unbounded (whole-column / whole-row)
+        // references like `A:A` or `1:1` so INDEX can resolve into them.
+        const EXCEL_MAX_ROWS: u32 = 1_048_576;
+        const EXCEL_MAX_COLS: u32 = 16_384;
+
         let (sheet, sr, sc, er, ec) = match base {
             ReferenceType::Range {
                 sheet,
@@ -206,14 +210,25 @@ impl Function for IndexFn {
                 end_row,
                 end_col,
                 ..
-            } => match (start_row, start_col, end_row, end_col) {
-                (Some(sr), Some(sc), Some(er), Some(ec)) => (sheet, sr, sc, er, ec),
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Ref))),
-            },
+            } => {
+                // Fill open bounds (e.g. `A:A`, `A5:A`, `A:A10`) by anchoring at
+                // row/column 1 and extending to the sheet limits, mirroring how
+                // ROWS/COLUMNS handle whole-column references.
+                let sr = start_row.unwrap_or(1);
+                let sc = start_col.unwrap_or(1);
+                let er = end_row.unwrap_or(EXCEL_MAX_ROWS);
+                let ec = end_col.unwrap_or(EXCEL_MAX_COLS);
+                (sheet, sr, sc, er, ec)
+            }
             ReferenceType::Cell {
                 sheet, row, col, ..
             } => (sheet, row, col, row, col),
-            _ => return Some(Err(ExcelError::new(ExcelErrorKind::Ref))),
+            // Named ranges (and other reference kinds) can't be turned into a
+            // sheet-qualified cell here; defer to eval()'s value path, which
+            // materialises them via resolve_range_view (preserving the target
+            // sheet by id, including non-ASCII sheet names) and indexes
+            // positionally.
+            _ => return None,
         };
 
         let (row, col) = match explicit_col {
@@ -971,6 +986,40 @@ mod tests {
             LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Ref),
             other => panic!("expected #REF!, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn index_whole_column_reference_resolves() {
+        // Regression test for #151: INDEX over a whole-column reference (A:A)
+        // must resolve like a bounded range instead of returning #REF!.
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(20))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(30))
+            .with_function(std::sync::Arc::new(IndexFn));
+
+        assert_eq!(
+            evaluate_formula("=INDEX(A:A,3)", &wb).unwrap(),
+            LiteralValue::Number(30.0)
+        );
+        assert_eq!(
+            evaluate_formula("=INDEX($A:$A,3)", &wb).unwrap(),
+            LiteralValue::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn index_whole_row_reference_resolves() {
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Int(20))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Int(30))
+            .with_function(std::sync::Arc::new(IndexFn));
+
+        assert_eq!(
+            evaluate_formula("=INDEX(1:1,3)", &wb).unwrap(),
+            LiteralValue::Number(30.0)
+        );
     }
 
     #[test]
