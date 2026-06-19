@@ -1,0 +1,91 @@
+From db4178cb8b9b7c8a5bb3f62f82f1cef56bd175ee Mon Sep 17 00:00:00 2001
+From: Verticka <verticka@gmail.com>
+Date: Fri, 19 Jun 2026 16:02:34 +0000
+Subject: [PATCH] fix: do not double-escape apostrophes when re-quoting sheet
+ names
+
+join_address received the sheet name from split_address, which strips
+only the surrounding quotes and leaves any internal escaped quote doubled
+(''). Re-escaping it with replace('\'', "''") turned a sheet like
+O'Brien (serialized 'O''Brien') into 'O''''Brien'. Wrap the name in
+quotes without re-escaping, since it is already in serialized form.
+
+Adds edge-case tests for apostrophe, space, range and plain sheet names
+through the shared-formula coordinate adjustment.
+---
+ src/helper/address.rs |  7 +++++--
+ src/helper/formula.rs | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/src/helper/address.rs b/src/helper/address.rs
+index 28f2cfa0..27862d6a 100644
+--- a/src/helper/address.rs
++++ b/src/helper/address.rs
+@@ -11,9 +11,12 @@ pub fn join_address(sheet_name: &str, address: &str) -> String {
+     if sheet_name == "" {
+         return address.to_string();
+     }
++    // `split_address` strips only the surrounding quotes and leaves any
++    // internal escaped quote doubled (`''`), i.e. the sheet name is already in
++    // its serialized form here, so re-quote without re-escaping (re-escaping
++    // would turn `O''Brien` into `O''''Brien`).
+     if sheet_name_needs_quoting(sheet_name) {
+-        let escaped = sheet_name.replace('\'', "''");
+-        return format!("'{}'!{}", escaped, address);
++        return format!("'{}'!{}", sheet_name, address);
+     }
+     format!("{}!{}", sheet_name, address)
+ }
+diff --git a/src/helper/formula.rs b/src/helper/formula.rs
+index 3299600f..0a0df86f 100644
+--- a/src/helper/formula.rs
++++ b/src/helper/formula.rs
+@@ -1007,3 +1007,45 @@ mod shared_formula_quoted_sheet_tests {
+         assert!(!out.contains("(1)!$E$38"), "sheet name lost its quotes: {}", out);
+     }
+ }
++
++#[cfg(test)]
++mod edge_quoted_sheet_tests {
++    use super::*;
++
++    fn adj(f: &str) -> String {
++        let mut tokens = parse_to_tokens(f.to_string());
++        adjustment_insert_formula_coordinate(&mut tokens, &0, &0, &2, &1, "", "Main", true)
++    }
++
++    #[test]
++    fn apostrophe_sheet_name() {
++        // 'O''Brien' is the sheet O'Brien. Must NOT become 'O''''Brien'.
++        let out = adj(r#"='O''Brien'!$A$1+1"#);
++        println!("apostrophe -> {out}");
++        assert!(out.contains("'O''Brien'!"), "double-escaped: {out}");
++        assert!(!out.contains("O''''Brien"), "double-escaped: {out}");
++    }
++
++    #[test]
++    fn space_sheet_name() {
++        let out = adj(r#"='My Sheet'!$A$1+1"#);
++        println!("space -> {out}");
++        assert!(out.contains("'My Sheet'!"), "lost quotes: {out}");
++    }
++
++    #[test]
++    fn quoted_sheet_range() {
++        let out = adj(r#"=SUM('(1)'!$E$38:$F$40)"#);
++        println!("range -> {out}");
++        assert!(out.contains("'(1)'!"), "lost quotes on range: {out}");
++        assert!(!out.contains("(1)!"), "unquoted: {out}");
++    }
++
++    #[test]
++    fn plain_sheet_unchanged() {
++        let out = adj("=Sheet1!$A$1+1");
++        println!("plain -> {out}");
++        assert!(out.contains("Sheet1!"), "plain mangled: {out}");
++        assert!(!out.contains("'Sheet1'"), "over-quoted: {out}");
++    }
++}
+-- 
+2.43.0
+
