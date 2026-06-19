@@ -37,8 +37,10 @@ members, so umya must expand them.
 
 ## Root cause (3 issues) and fix
 
-See `docs/umya-shared-formula-quoted-sheet.patch` (apply in the
-`umya-spreadsheet` repo). In `src/helper/formula.rs::parse_to_tokens`:
+The fix lives in `docs/umya-shared-formula-quoted-sheet.patch`, a
+`git format-patch` (apply with `git am`, base **PSU3D0/umya-spreadsheet**
+rev `4b64d65` — the 2.3.2 base formualizer pins). It touches
+`src/helper/formula.rs::parse_to_tokens`:
 
 1. On a `'` (start of a quoted sheet path), the tokenizer sets `in_string = true`
    instead of `in_path = true`, so it scans for a closing `"` and swallows the
@@ -53,28 +55,50 @@ In `src/helper/address.rs::join_address`:
    round-trips to the invalid `(1)!$E$38`. `join_address` must re-quote sheet
    names that are not bare identifiers (and double internal `'`).
 
-## Regression tests (for the `umya-spreadsheet` PR)
+## Regression tests
 
-Add to `src/helper/formula.rs` (both fail on stock, pass with the patch):
+The patch already appends two tests to `src/helper/formula.rs`
+(`quoted_sheet_ref_round_trips`, `shared_adjustment_preserves_quoted_sheet`) —
+both fail on stock umya and pass with the fix.
 
-```rust
-#[cfg(test)]
-mod shared_formula_quoted_sheet_tests {
-    use super::*;
+On the formualizer side, `crates/formualizer-workbook/tests/umya/shared_formula_quoted_sheet.rs`
+loads `tests/fixtures/shared_formula_quoted_sheet.xlsx` end-to-end and asserts
+`Main!B2 = Main!B3 = "42-x"`, `Main!B4 = ""`. It is `#[ignore]`d because the
+default `[patch.crates-io]` umya (PSU3D0 2.3.2) is unpatched; run it with the
+patched umya pinned (below):
 
-    #[test]
-    fn quoted_sheet_ref_round_trips() {
-        let f = r#"IF(A2=1,'(1)'!$E$38&"-x","")"#;
-        assert_eq!(render(&parse_to_tokens(format!("={}", f))), f);
-    }
+```
+cargo test -p formualizer-workbook --features umya --test umya \
+  shared_formula_quoted_sheet -- --ignored
+```
 
-    #[test]
-    fn shared_adjustment_preserves_quoted_sheet() {
-        let mut tokens = parse_to_tokens(r#"=IF(A2=1,'(1)'!$E$38&"-x","")"#);
-        let out =
-            adjustment_insert_formula_coordinate(&mut tokens, &0, &0, &2, &1, "", "Main", true);
-        assert!(out.contains("'(1)'!$E$38"), "quoted sheet ref corrupted: {out}");
-        assert!(!out.contains("(1)!$E$38"), "sheet name lost its quotes: {out}");
-    }
-}
+## Wiring the fix into formualizer (final step)
+
+formualizer pins `umya-spreadsheet = "=2.3.2"`, so the patched crate **must**
+keep version 2.3.2 — i.e. the fix has to sit on the PSU3D0 2.3.2 base
+(`4b64d65`), **not** on upstream umya 3.0.0. Push a 2.3.2-based branch carrying
+the patch to your fork:
+
+```sh
+git clone https://github.com/PSU3D0/umya-spreadsheet.git
+cd umya-spreadsheet
+git checkout -b fix/shared-formula-quoted-sheet-2.3.2 4b64d65
+git am < /path/to/formualizer/docs/umya-shared-formula-quoted-sheet.patch
+cargo test --lib shared_formula_quoted_sheet   # 2 tests pass
+git remote add verticka https://github.com/verticka/umya-spreadsheet.git
+git push verticka fix/shared-formula-quoted-sheet-2.3.2
+```
+
+Then point formualizer's `[patch.crates-io]` (in the workspace `Cargo.toml`) at
+that branch's commit and refresh the lock:
+
+```toml
+[patch.crates-io]
+umya-spreadsheet = { git = "https://github.com/verticka/umya-spreadsheet.git", rev = "<pushed_commit_sha>" }
+```
+
+```sh
+cargo update umya-spreadsheet
+# remove the #[ignore] on loads_shared_formula_with_quoted_sheet_ref
+cargo test -p formualizer-workbook --features umya --test umya shared_formula_quoted_sheet
 ```
