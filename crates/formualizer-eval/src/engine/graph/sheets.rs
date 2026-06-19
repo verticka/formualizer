@@ -11,6 +11,7 @@ impl DependencyGraph {
         if let Some(id) = self.sheet_reg.get_id(name) {
             return Ok(id);
         }
+        self.structural_epoch = self.structural_epoch.wrapping_add(1);
 
         let sheet_id = self.sheet_reg.id_for(name);
         self.sheet_indexes.entry(sheet_id).or_default();
@@ -33,6 +34,7 @@ impl DependencyGraph {
                 ExcelError::new(ExcelErrorKind::Value).with_message("Cannot remove the last sheet")
             );
         }
+        self.structural_epoch = self.structural_epoch.wrapping_add(1);
 
         self.begin_batch();
 

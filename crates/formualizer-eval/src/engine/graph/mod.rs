@@ -173,6 +173,12 @@ pub struct DependencyGraph {
     dirty_vertices: FxHashSet<VertexId>,
     volatile_vertices: FxHashSet<VertexId>,
 
+    /// Monotonic counter bumped on graph-level structural mutations (sheet
+    /// add/remove). The value-change recalc gate disarms when it changes since
+    /// the last recalc, so structural edits applied directly on the graph
+    /// (bypassing the engine's edit signalling) can never be wrongly skipped.
+    structural_epoch: u64,
+
     /// Monotonic count of vertices processed by dirty-propagation BFS loops
     /// (`mark_dirty_many` / `mark_dirty_many_value_cells`). Cheap plain
     /// counter used by perf-shape tests to assert propagation work is
@@ -1074,6 +1080,7 @@ impl DependencyGraph {
             deferred_dirty_depth: 0,
             deferred_dirty_pending: Vec::new(),
             volatile_vertices: FxHashSet::default(),
+            structural_epoch: 0,
             ref_error_vertices: FxHashSet::default(),
             formula_to_range_deps: FxHashMap::default(),
             stripe_to_dependents: FxHashMap::default(),
@@ -3430,6 +3437,19 @@ impl DependencyGraph {
     /// Check if a vertex is volatile
     pub(crate) fn is_volatile(&self, vertex_id: VertexId) -> bool {
         self.store.is_volatile(vertex_id)
+    }
+
+    /// Structural-mutation counter (see field docs).
+    pub(crate) fn structural_epoch(&self) -> u64 {
+        self.structural_epoch
+    }
+
+    /// Whether any external data source (scalar or table) is registered. Source
+    /// reads are version-invalidated outside the vertex dependency graph, so a
+    /// source-reading formula can change value without any tracked dependency
+    /// changing; the value-change recalc gate disarms when sources are present.
+    pub(crate) fn has_external_sources(&self) -> bool {
+        !self.source_scalars.is_empty() || !self.source_tables.is_empty()
     }
 
     pub(crate) fn is_dynamic(&self, vertex_id: VertexId) -> bool {

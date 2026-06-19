@@ -567,6 +567,19 @@ pub struct Engine<R> {
     /// recalc reuses one set of allocations.
     scc_scratch: SccScratch,
 
+    /// Members of SCCs that iterated on the most recent recalc (drained from
+    /// `pending_iterative_redirty`). The value-change recalc gate must never
+    /// skip these: an iterating SCC re-evaluates every recalc regardless of
+    /// whether its inputs changed (spec §4/§7.6, Excel circular-cell parity).
+    last_iterative_members: FxHashSet<VertexId>,
+
+    /// Graph structural-mutation epoch observed at the end of the last full
+    /// recalc. The value-change gate disarms when the current epoch differs, so
+    /// structural edits applied directly on the graph (bypassing the engine's
+    /// `has_edited` signalling) are never wrongly skipped. `u64::MAX` until the
+    /// first recalc so the gate never arms on a cold engine.
+    last_recalc_structural_epoch: u64,
+
     /// FormulaPlane authority `indexes_epoch` observed by the most recent
     /// successful `evaluate_all` pass. Used to schedule whole-span work for
     /// any active span the engine has not yet evaluated under the current
@@ -1563,6 +1576,8 @@ where
             pending_iterative_redirty: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             scc_scratch: SccScratch::default(),
+            last_iterative_members: FxHashSet::default(),
+            last_recalc_structural_epoch: u64::MAX,
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -1643,6 +1658,8 @@ where
             pending_iterative_redirty: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             scc_scratch: SccScratch::default(),
+            last_iterative_members: FxHashSet::default(),
+            last_recalc_structural_epoch: u64::MAX,
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -1727,6 +1744,11 @@ where
         if !pending.is_empty() {
             self.graph.redirty_iterative_members(&pending);
         }
+        // Remember which members iterate so the next recalc's value-change
+        // gate never skips an iterating SCC (it re-evaluates every recalc, like
+        // an Excel circular cell, even when its inputs are unchanged).
+        self.last_iterative_members.clear();
+        self.last_iterative_members.extend(pending);
     }
 
     pub fn virtual_dep_fallback_activations(&self) -> u64 {
@@ -2474,6 +2496,8 @@ where
         name: impl AsRef<str>,
         f: impl FnOnce(&mut EngineAction<'_, R>) -> Result<T, crate::engine::EditorError>,
     ) -> Result<T, crate::engine::EditorError> {
+        // Transactional edits mutate cells/formulas; disarm the value-change gate.
+        self.has_edited = true;
         if self.action_depth != 0 {
             return Err(crate::engine::EditorError::TransactionFailed {
                 reason: "Nested Engine::action calls are not supported (ticket 614: commit-only surface)"
@@ -2611,6 +2635,7 @@ where
         name: impl AsRef<str>,
         f: impl FnOnce(&mut EngineAction<'_, R>) -> Result<T, crate::engine::EditorError>,
     ) -> Result<T, crate::engine::EditorError> {
+        self.has_edited = true;
         if self.action_depth != 0 {
             return Err(crate::engine::EditorError::TransactionFailed {
                 reason: "Nested Engine::action calls are not supported (deterministic rule)"
@@ -2774,6 +2799,7 @@ where
         undo: &mut crate::engine::graph::editor::undo_engine::UndoEngine,
         log: &mut crate::engine::ChangeLog,
     ) -> Result<(), crate::engine::EditorError> {
+        self.has_edited = true;
         let batch = undo.undo(&mut self.graph, log)?;
         for item in batch.iter().rev() {
             self.apply_inverse_row_visibility_event(&item.event);
@@ -2793,6 +2819,7 @@ where
         undo: &mut crate::engine::graph::editor::undo_engine::UndoEngine,
         log: &mut crate::engine::ChangeLog,
     ) -> Result<(), crate::engine::EditorError> {
+        self.has_edited = true;
         let batch = undo.redo(&mut self.graph, log)?;
         for item in &batch {
             self.apply_forward_row_visibility_event(&item.event);
@@ -8273,6 +8300,9 @@ where
         &mut self,
         targets: &[(&str, u32, u32)],
     ) -> Result<EvalResult, ExcelError> {
+        // Partial evaluation can leave SCCs un-refreshed; only a full legacy
+        // `evaluate_all` may arm the value-change skip gate.
+        self.has_edited = true;
         #[cfg(feature = "tracing")]
         let _span_eval = tracing::info_span!("evaluate_until", targets = targets.len()).entered();
         let start = crate::instant::FzInstant::now();
@@ -8378,6 +8408,7 @@ where
         targets: &[(&str, u32, u32)],
         delta: &mut DeltaCollector,
     ) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         #[cfg(feature = "tracing")]
         let _span_eval =
             tracing::info_span!("evaluate_until_with_delta", targets = targets.len()).entered();
@@ -8479,6 +8510,7 @@ where
 
     /// Evaluate using a previously constructed plan. This avoids rebuilding layer schedules for each run.
     pub fn evaluate_recalc_plan(&mut self, plan: &RecalcPlan) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         self.validate_deterministic_mode()?;
@@ -8560,6 +8592,9 @@ where
         })
     }
     fn evaluate_authoritative_formula_plane_all(&mut self) -> Result<EvalResult, ExcelError> {
+        // The value-change skip gate is armed only by the legacy full-recalc
+        // path; disarm it here so a FormulaPlane recalc never leaves it armed.
+        self.has_edited = true;
         // Fresh per-request cycle counters. Some callers (`evaluate_vertex`,
         // `evaluate_cells*`) reach this coordinator without an entry-point
         // reset; callers that did reset have accumulated nothing in between,
@@ -9086,22 +9121,83 @@ where
     fn legacy_pass_run_units(
         &mut self,
         schedule: &crate::engine::scheduler::Schedule,
+        gate_eligible: bool,
     ) -> Result<(usize, usize), ExcelError> {
         let mut computed_vertices = 0;
         let mut cycle_count = 0;
+        // Value-change recalc gate (armed only on an edit-free recalc). A
+        // formula's value is a deterministic function of its inputs, so on a
+        // recalc with no edits a vertex can only change if one of its
+        // dependencies changed value this pass (or it is volatile/dynamic).
+        // Walking units in condensation order, `changed` accumulates the
+        // vertices whose value actually changed; any vertex (or whole SCC)
+        // whose inputs are all unchanged is skipped, keeping its committed
+        // overlay value. This collapses the common volatile-guard phantom
+        // pattern — a volatile re-dirties the whole sheet every recalc, yet
+        // nothing downstream actually changes — from a full recompute to
+        // re-evaluating just the volatiles. Disarmed by any edit
+        // (`mark_data_edited`/`mark_topology_edited`) or partial evaluation.
+        let gate_armed = gate_eligible
+            && !self.has_edited
+            && !self.graph.has_external_sources()
+            && self.graph.structural_epoch() == self.last_recalc_structural_epoch;
+        let mut changed: FxHashSet<VertexId> = FxHashSet::default();
+        let mut old_values: Vec<LiteralValue> = Vec::new();
         for &unit in &schedule.units {
             match unit {
                 ScheduleUnit::Cycle(i) => {
-                    if self.handle_cycle_unit(schedule.unit_cycle(i), None, None, None)? > 0 {
+                    let cycle = schedule.unit_cycle(i);
+                    if gate_armed && !self.scc_unit_must_eval(cycle, &changed) {
+                        continue; // inputs unchanged ⇒ committed values still hold
+                    }
+                    if gate_armed {
+                        old_values.clear();
+                        old_values.extend(cycle.iter().map(|&v| self.read_vertex_committed_value(v)));
+                    }
+                    if self.handle_cycle_unit(cycle, None, None, None)? > 0 {
                         cycle_count += 1;
+                    }
+                    if gate_armed {
+                        for (idx, &v) in cycle.iter().enumerate() {
+                            if self.read_vertex_committed_value(v) != old_values[idx] {
+                                changed.insert(v);
+                            }
+                        }
                     }
                 }
                 ScheduleUnit::Layer(i) => {
                     let layer = schedule.unit_layer(i);
-                    if self.thread_pool.is_some() && layer.vertices.len() > 1 {
-                        computed_vertices += self.evaluate_layer_parallel(layer)?;
+                    if !gate_armed {
+                        if self.thread_pool.is_some() && layer.vertices.len() > 1 {
+                            computed_vertices += self.evaluate_layer_parallel(layer)?;
+                        } else {
+                            computed_vertices += self.evaluate_layer_sequential(layer)?;
+                        }
+                        continue;
+                    }
+                    // Gated: evaluate only the vertices whose inputs changed
+                    // (or that must always run), then record which changed.
+                    let subset: Vec<VertexId> = layer
+                        .vertices
+                        .iter()
+                        .copied()
+                        .filter(|&v| self.vertex_must_eval(v, &changed))
+                        .collect();
+                    if subset.is_empty() {
+                        continue;
+                    }
+                    old_values.clear();
+                    old_values.extend(subset.iter().map(|&v| self.read_vertex_committed_value(v)));
+                    let sub_layer = super::scheduler::Layer { vertices: subset };
+                    if self.thread_pool.is_some() && sub_layer.vertices.len() > 1 {
+                        computed_vertices += self.evaluate_layer_parallel(&sub_layer)?;
                     } else {
-                        computed_vertices += self.evaluate_layer_sequential(layer)?;
+                        computed_vertices += self.evaluate_layer_sequential(&sub_layer)?;
+                    }
+                    for (idx, &v) in sub_layer.vertices.iter().enumerate() {
+                        if self.read_vertex_committed_value(v) != old_values[idx] {
+                            changed.insert(v);
+                        }
                     }
                 }
             }
@@ -9120,6 +9216,82 @@ where
     /// counts (G8 demotion path), and both sub-passes belong to ONE request /
     /// one clock sample; request begin happens at the public entry points /
     /// coordinators instead.
+    /// Read a vertex's currently-committed value the way a reader would see it:
+    /// overlay-first for cells (the value home in canonical mode), graph value
+    /// map otherwise. Used by the value-change recalc gate.
+    fn read_vertex_committed_value(&self, vertex: VertexId) -> LiteralValue {
+        if let Some(cell) = self.graph.get_cell_ref(vertex) {
+            let sheet_name = self.graph.sheet_name(cell.sheet_id);
+            self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                .unwrap_or(LiteralValue::Empty)
+        } else {
+            self.graph.get_value(vertex).unwrap_or(LiteralValue::Empty)
+        }
+    }
+
+    /// Whether a vertex that is forced to always re-evaluate under the
+    /// value-change gate (regardless of input changes): volatile/dynamic
+    /// functions (their value is not a pure function of tracked inputs),
+    /// non-scalar formulas (arrays/spill — their effect is not captured by a
+    /// scalar value compare), spill anchors, and range readers (range cell
+    /// changes are not enumerated as vertex deps).
+    fn vertex_always_reeval(&self, v: VertexId) -> bool {
+        if !matches!(self.graph.get_vertex_kind(v), VertexKind::FormulaScalar) {
+            return true;
+        }
+        self.graph.is_volatile(v)
+            || self.graph.is_dynamic(v)
+            || self.graph.get_range_dependencies(v).is_some()
+            || self.graph.spill_cells_for_anchor(v).is_some()
+    }
+
+    /// Gate decision for one layer vertex: evaluate iff it must always run or a
+    /// dependency changed value this pass. A dependency that no longer exists
+    /// (e.g. a tombstoned cross-sheet ref after the target sheet was removed)
+    /// also forces re-evaluation — its disappearance changes the result.
+    fn vertex_must_eval(&self, v: VertexId, changed: &FxHashSet<VertexId>) -> bool {
+        if self.vertex_always_reeval(v) {
+            return true;
+        }
+        if let Some(deps) = self.graph.dependencies_slice(v) {
+            deps.iter()
+                .any(|d| changed.contains(d) || !self.graph.vertex_exists(*d))
+        } else {
+            self.graph
+                .get_dependencies(v)
+                .iter()
+                .any(|d| changed.contains(d) || !self.graph.vertex_exists(*d))
+        }
+    }
+
+    /// Gate decision for one `Cycle` unit: evaluate iff any member must always
+    /// run, any member iterates, or any external dependency changed this pass.
+    fn scc_unit_must_eval(&self, cycle: &[VertexId], changed: &FxHashSet<VertexId>) -> bool {
+        for &member in cycle {
+            if self.vertex_always_reeval(member) || self.last_iterative_members.contains(&member) {
+                return true;
+            }
+        }
+        for &member in cycle {
+            if let Some(deps) = self.graph.dependencies_slice(member) {
+                if deps
+                    .iter()
+                    .any(|dep| !cycle.contains(dep) && changed.contains(dep))
+                {
+                    return true;
+                }
+            } else if self
+                .graph
+                .get_dependencies(member)
+                .iter()
+                .any(|dep| !cycle.contains(dep) && changed.contains(dep))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn evaluate_all_legacy_impl(&mut self) -> Result<EvalResult, ExcelError> {
         self.reset_virtual_dep_telemetry_if_disabled();
         #[cfg(feature = "tracing")]
@@ -9150,7 +9322,12 @@ where
                 Self::accumulate_schedule_meta(t, &meta);
             }
 
-            let (pass_computed, pass_cycles) = self.legacy_pass_run_units(&schedule)?;
+            // The value-change skip gate is gated further inside on edit-free /
+            // structurally-stable / source-free state; only the very first
+            // recalc (no prior committed values) is excluded here.
+            let gate_eligible = self.recalc_epoch > 0;
+            let (pass_computed, pass_cycles) =
+                self.legacy_pass_run_units(&schedule, gate_eligible)?;
             computed_vertices += pass_computed;
             cycle_errors += pass_cycles;
 
@@ -9192,6 +9369,13 @@ where
         // Advance recalc epoch after a full evaluation pass finishes
         self.recalc_epoch = self.recalc_epoch.wrapping_add(1);
 
+        // A full recalc brought every dirty vertex to a consistent value, so a
+        // subsequent recalc with no intervening edit and no structural mutation
+        // is "pure" and the value-change gate may arm. Any edit re-sets
+        // `has_edited`; direct-on-graph structural edits bump `structural_epoch`.
+        self.has_edited = false;
+        self.last_recalc_structural_epoch = self.graph.structural_epoch();
+
         Ok(EvalResult {
             computed_vertices,
             cycle_errors,
@@ -9209,6 +9393,7 @@ where
         &mut self,
         delta: &mut DeltaCollector,
     ) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         if self.config.defer_graph_building {
