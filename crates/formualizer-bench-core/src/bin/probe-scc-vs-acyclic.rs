@@ -31,51 +31,73 @@ fn main() -> anyhow::Result<()> {
         /// Build the acyclic control (no mutual reference, no SCC).
         #[arg(long)]
         acyclic: bool,
+        /// Disable the value-change recalc gate (measure its overhead).
+        #[arg(long)]
+        no_gate: bool,
+        /// Worst case: each consumer also reads the changing volatile, so every
+        /// edit-free recalc changes every consumer value (gate cannot skip).
+        #[arg(long)]
+        changing: bool,
     }
 
     let cli = Cli::parse();
     let dir = std::env::temp_dir().join("scc-vs-acyclic");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(if cli.acyclic {
-        format!("acyclic-{}.xlsx", cli.rows)
-    } else {
-        format!("cyclic-{}.xlsx", cli.rows)
-    });
+    let path = dir.join(format!(
+        "{}{}-{}.xlsx",
+        if cli.acyclic { "acyclic" } else { "cyclic" },
+        if cli.changing { "-chg" } else { "" },
+        cli.rows
+    ));
 
     let acyclic = cli.acyclic;
+    let changing = cli.changing;
     write_workbook(&path, |book| {
         let sheet = book.get_sheet_by_name_mut("Sheet1").unwrap();
-        // A1: volatile guard so every recalc re-dirties the whole sheet.
-        sheet
-            .get_cell_mut((1, 1))
-            .set_formula("IF(NOW()>DATE(2000,1,1),1,1)");
+        // A1: volatile guard so every recalc re-dirties the whole sheet. In
+        // `changing` mode it is NOW() itself (its value changes every recalc).
+        sheet.get_cell_mut((1, 1)).set_formula(if changing {
+            "RAND()".to_string()
+        } else {
+            "IF(NOW()>DATE(2000,1,1),1,1)".to_string()
+        });
         for r in 0..cli.rows {
             let row = r as u32 + 2;
+            let guard = if changing {
+                format!("$A$1>DATE(2000,1,1)")
+            } else {
+                format!("$A$1")
+            };
             if acyclic {
                 // No mutual reference -> two independent acyclic formulas.
                 sheet
                     .get_cell_mut((1, row))
-                    .set_formula(format!("IF($A$1,1,99)"));
+                    .set_formula(format!("IF({guard},1,99)"));
                 sheet
                     .get_cell_mut((2, row))
-                    .set_formula(format!("IF($A$1,98,1)"));
+                    .set_formula(format!("IF({guard},98,1)"));
             } else {
                 // Mutual reference -> one 2-member phantom SCC per row.
                 sheet
                     .get_cell_mut((1, row))
-                    .set_formula(format!("IF($A$1,1,B{row})"));
+                    .set_formula(format!("IF({guard},1,B{row})"));
                 sheet
                     .get_cell_mut((2, row))
-                    .set_formula(format!("IF($A$1,A{row},1)"));
+                    .set_formula(format!("IF({guard},A{row},1)"));
             }
-            sheet
-                .get_cell_mut((3, row))
-                .set_formula(format!("A{row}+B{row}"));
+            // In `changing` mode the consumer reads the changing volatile, so
+            // its value differs every recalc and the gate must re-evaluate it.
+            sheet.get_cell_mut((3, row)).set_formula(if changing {
+                format!("A{row}+B{row}+$A$1")
+            } else {
+                format!("A{row}+B{row}")
+            });
         }
     });
 
     let mut config = WorkbookConfig::ephemeral();
     config.eval = config.eval.with_cycle(CycleConfig::iterate(100, 0.001));
+    config.eval.value_change_gate_enabled = !cli.no_gate;
     let backend = UmyaAdapter::open_path(&path)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
     let mut wb = Workbook::from_reader(backend, LoadStrategy::EagerAll, config)

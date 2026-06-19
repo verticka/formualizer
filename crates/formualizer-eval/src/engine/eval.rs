@@ -9138,6 +9138,7 @@ where
         // re-evaluating just the volatiles. Disarmed by any edit
         // (`mark_data_edited`/`mark_topology_edited`) or partial evaluation.
         let gate_armed = gate_eligible
+            && self.config.value_change_gate_enabled
             && !self.has_edited
             && !self.graph.has_external_sources()
             && self.graph.structural_epoch() == self.last_recalc_structural_epoch;
