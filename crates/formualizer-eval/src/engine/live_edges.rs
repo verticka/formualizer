@@ -89,6 +89,7 @@ struct CollectorState {
 /// Member indices are split: cell members occupy `0..cell_count`, name
 /// members occupy `cell_count..cell_count + name_count` (matching the spec
 /// §7.13 member ordering used by SCC tasks: cells first, then names).
+#[derive(Default)]
 pub struct LiveEdgeCollector {
     /// Iterable membership for rect intersection.
     members: Vec<MemberCell>,
@@ -142,6 +143,35 @@ impl LiveEdgeCollector {
             total_members,
             state: Mutex::new(CollectorState::default()),
         }
+    }
+
+    /// Re-point an existing collector at a new SCC membership, reusing the
+    /// allocations from the previous task. Equivalent to [`Self::new_with_names`]
+    /// but clears (rather than reallocates) the maps and edge set, so a single
+    /// collector can serve every SCC task in a recalc. Member-index semantics
+    /// are identical to construction.
+    pub fn reset_with_names(&mut self, cells: &[CellRef], names: &[String]) {
+        self.members.clear();
+        self.members.extend(cells.iter().map(|c| MemberCell {
+            sheet_id: c.sheet_id,
+            row: c.coord.row(),
+            col: c.coord.col(),
+        }));
+        self.index.clear();
+        self.index.reserve(self.members.len());
+        for (i, m) in self.members.iter().enumerate() {
+            self.index.insert((m.sheet_id, m.row, m.col), i as u32);
+        }
+        self.name_index.clear();
+        self.name_index.reserve(names.len());
+        for (j, name) in names.iter().enumerate() {
+            self.name_index
+                .insert(name.clone(), (self.members.len() + j) as u32);
+        }
+        self.total_members = self.members.len() + names.len();
+        let mut st = self.state.lock().unwrap();
+        st.current = None;
+        st.edges.clear();
     }
 
     pub fn member_count(&self) -> usize {
@@ -203,6 +233,14 @@ impl LiveEdgeCollector {
     /// attribution is preserved).
     pub fn take_edges(&self) -> FxHashSet<(u32, u32)> {
         std::mem::take(&mut self.state.lock().unwrap().edges)
+    }
+
+    /// Drain the collected edges into `out`, leaving the collector's edge set
+    /// empty but with its capacity intact (current member attribution is
+    /// preserved). Lets SCC tasks reuse the set's allocation across passes.
+    pub fn drain_edges_into(&self, out: &mut Vec<(u32, u32)>) {
+        let mut st = self.state.lock().unwrap();
+        out.extend(st.edges.drain());
     }
 }
 

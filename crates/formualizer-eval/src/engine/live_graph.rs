@@ -42,16 +42,75 @@ impl LiveGraphAnalysis {
     }
 }
 
+/// Reusable working buffers for [`analyze_live_graph_into`]. One instance is
+/// reset and reused across every SCC task in an evaluation (SCC tasks run
+/// sequentially on the coordinating thread), so the seven Vecs Tarjan needs are
+/// allocated once for the whole recalc instead of once per statically-cyclic
+/// SCC. This is the dominant fixed cost on workbooks with hundreds/thousands of
+/// phantom SCCs (RFC #112 Stage 2b). Capacities only ever grow.
+#[derive(Default)]
+pub(crate) struct LiveGraphScratch {
+    // ── Tarjan DFS internals (reused; contents meaningless between calls) ──
+    adj_start: Vec<usize>,
+    index: Vec<u32>,
+    lowlink: Vec<u32>,
+    on_stack: Vec<bool>,
+    stack: Vec<u32>,
+    frames: Vec<(u32, usize)>,
+    // ── Outputs, mirroring `LiveGraphAnalysis` ──
+    /// `in_cycle[i]` — member `i` lies on a live cycle (live SCC size > 1, or a
+    /// live self-edge).
+    pub in_cycle: Vec<bool>,
+    /// Members in live-topological order (dependencies before dependents).
+    pub topo: Vec<u32>,
+    /// Number of distinct live cycles witnessed by the last analysis.
+    pub cycle_count: usize,
+    /// Scratch backing [`Self::topo_positions`].
+    pos: Vec<u32>,
+}
+
+impl LiveGraphScratch {
+    /// `pos[i]` = position of member `i` in `topo`, written into the reusable
+    /// `pos` buffer. Mirrors [`LiveGraphAnalysis::topo_positions`] without
+    /// allocating.
+    pub fn topo_positions(&mut self) -> &[u32] {
+        self.pos.clear();
+        self.pos.resize(self.topo.len(), 0);
+        for (p, &i) in self.topo.iter().enumerate() {
+            self.pos[i as usize] = p as u32;
+        }
+        &self.pos
+    }
+}
+
 /// Iterative Tarjan over `n` nodes and directed `edges` (`from` depends on
-/// `to`). `edges` must be sorted and deduplicated for deterministic output.
-pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAnalysis {
+/// `to`), writing its classification into the reusable `scratch` (`in_cycle`,
+/// `topo`, `cycle_count`). Semantics are identical to [`analyze_live_graph`];
+/// the only difference is that working buffers are reused across calls instead
+/// of freshly allocated. `edges` must be sorted and deduplicated for
+/// deterministic output.
+pub(crate) fn analyze_live_graph_into(scratch: &mut LiveGraphScratch, n: usize, edges: &[(u32, u32)]) {
     debug_assert!(
         edges.is_sorted(),
         "live edges must be sorted for determinism"
     );
 
+    // Move the working buffers out so the local code reads exactly like the
+    // owned version below; they are restored (with grown capacity) at the end.
+    let mut adj_start = std::mem::take(&mut scratch.adj_start);
+    let mut index = std::mem::take(&mut scratch.index);
+    let mut lowlink = std::mem::take(&mut scratch.lowlink);
+    let mut on_stack = std::mem::take(&mut scratch.on_stack);
+    let mut stack = std::mem::take(&mut scratch.stack);
+    let mut frames = std::mem::take(&mut scratch.frames);
+    let mut in_cycle = std::mem::take(&mut scratch.in_cycle);
+    let mut topo = std::mem::take(&mut scratch.topo);
+
+    const UNVISITED: u32 = u32::MAX;
+
     // CSR adjacency.
-    let mut adj_start = vec![0usize; n + 1];
+    adj_start.clear();
+    adj_start.resize(n + 1, 0);
     for &(from, _) in edges {
         adj_start[from as usize + 1] += 1;
     }
@@ -61,21 +120,25 @@ pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAna
     // `edges` is sorted by `from`, so the slice for node i is contiguous.
     let adj = |i: usize| -> &[(u32, u32)] { &edges[adj_start[i]..adj_start[i + 1]] };
 
-    const UNVISITED: u32 = u32::MAX;
-    let mut index = vec![UNVISITED; n];
-    let mut lowlink = vec![0u32; n];
-    let mut on_stack = vec![false; n];
-    let mut stack: Vec<u32> = Vec::new();
+    index.clear();
+    index.resize(n, UNVISITED);
+    lowlink.clear();
+    lowlink.resize(n, 0);
+    on_stack.clear();
+    on_stack.resize(n, false);
+    stack.clear();
     let mut next_index = 0u32;
 
-    let mut in_cycle = vec![false; n];
+    in_cycle.clear();
+    in_cycle.resize(n, false);
     let mut cycle_count = 0usize;
     // Tarjan emits an SCC only after all SCCs it depends on were emitted, so
     // emission order == live-topological order (dependencies first).
-    let mut topo: Vec<u32> = Vec::with_capacity(n);
+    topo.clear();
+    topo.reserve(n);
 
     // Explicit DFS frames: (node, next-edge-offset within its adjacency).
-    let mut frames: Vec<(u32, usize)> = Vec::new();
+    frames.clear();
     for root in 0..n as u32 {
         if index[root as usize] != UNVISITED {
             continue;
@@ -134,10 +197,29 @@ pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAna
         }
     }
 
+    // Restore the working buffers (now grown) and publish the outputs.
+    scratch.adj_start = adj_start;
+    scratch.index = index;
+    scratch.lowlink = lowlink;
+    scratch.on_stack = on_stack;
+    scratch.stack = stack;
+    scratch.frames = frames;
+    scratch.in_cycle = in_cycle;
+    scratch.topo = topo;
+    scratch.cycle_count = cycle_count;
+}
+
+/// Allocating wrapper retained for tests and external callers: classifies the
+/// live graph into an owned [`LiveGraphAnalysis`]. Production SCC tasks use
+/// [`analyze_live_graph_into`] with a reused [`LiveGraphScratch`].
+#[cfg(test)]
+pub(crate) fn analyze_live_graph(n: usize, edges: &[(u32, u32)]) -> LiveGraphAnalysis {
+    let mut scratch = LiveGraphScratch::default();
+    analyze_live_graph_into(&mut scratch, n, edges);
     LiveGraphAnalysis {
-        in_cycle,
-        cycle_count,
-        topo,
+        in_cycle: scratch.in_cycle,
+        cycle_count: scratch.cycle_count,
+        topo: scratch.topo,
     }
 }
 

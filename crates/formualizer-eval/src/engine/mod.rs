@@ -656,6 +656,14 @@ pub struct EvalConfig {
     /// This enables Arrow-only RangeView correctness without Hybrid fallback.
     pub write_formula_overlay_enabled: bool,
 
+    /// Enable the value-change recalc gate: on an edit-free recalc, skip
+    /// re-evaluating any vertex/SCC whose inputs are all unchanged (keeping its
+    /// committed value). Collapses volatile-guard phantom-SCC recompute storms.
+    /// Adds a small per-evaluated-vertex change-detection cost, so it can be
+    /// disabled for workloads dominated by edit-free recalcs that change most
+    /// values anyway (e.g. RAND-heavy sheets). Default: enabled.
+    pub value_change_gate_enabled: bool,
+
     /// Optional memory budget (in bytes) for formula/spill computed Arrow overlays.
     ///
     /// When set, the engine will compact computed overlays into base lanes when the
@@ -733,6 +741,7 @@ impl Default for EvalConfig {
             arrow_storage_enabled: true,
             delta_overlay_enabled: true,
             write_formula_overlay_enabled: true,
+            value_change_gate_enabled: true,
             max_overlay_memory_bytes: None,
             date_system: DateSystem::Excel1900,
             formula_parse_policy: FormulaParsePolicy::Strict,

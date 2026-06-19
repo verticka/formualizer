@@ -4,7 +4,7 @@ use crate::engine::arena::AstNodeId;
 use crate::engine::eval_delta::{DeltaCollector, DeltaMode, EvalDelta};
 use crate::engine::ingest_pipeline::{DependencyPlanRow, FormulaAstInput};
 use crate::engine::live_edges::{LiveEdgeCollector, RecordingContext};
-use crate::engine::live_graph::analyze_live_graph;
+use crate::engine::live_graph::{LiveGraphScratch, analyze_live_graph_into};
 use crate::engine::lookup_index_cache::{
     BuildOutcome, LookupAxis, LookupIndex, LookupIndexCache, LookupIndexCacheReport,
     LookupIndexKey, estimate_bytes,
@@ -402,6 +402,59 @@ impl ComputedWriteChunkPlan {
     }
 }
 
+/// Reusable working buffers for [`Engine::evaluate_scc_unit`]. SCC tasks run
+/// sequentially on the coordinating thread, so a single instance — taken out
+/// of the engine for the duration of one task and restored afterwards — lets
+/// every statically-cyclic SCC in a recalc share the same allocations instead
+/// of allocating a dozen Vecs per task. On workbooks with hundreds/thousands
+/// of phantom SCCs this is the dominant per-task fixed cost (RFC #112 Stage
+/// 2b). All buffers are cleared (capacity retained) at the start of each task;
+/// contents never carry meaning between tasks.
+/// One SCC member in evaluation order: its vertex plus, for cell members, the
+/// cell reference (name/other members carry `None`).
+pub(crate) struct SccMember {
+    vertex: VertexId,
+    cell: Option<CellRef>,
+}
+
+#[derive(Default)]
+pub(crate) struct SccScratch {
+    /// Cell members paired with their refs, before ordering.
+    cell_members: Vec<(VertexId, CellRef)>,
+    /// Name members paired with their folded keys, before ordering.
+    name_members: Vec<(VertexId, String)>,
+    /// Non-cell/non-name members (defensive; never evaluated).
+    other_members: Vec<VertexId>,
+    /// Ordered cell refs handed to the live-edge collector.
+    cell_refs: Vec<CellRef>,
+    /// Ordered folded name keys handed to the live-edge collector.
+    name_keys: Vec<String>,
+    /// Members in evaluation order (cells, then names, then others).
+    members: Vec<SccMember>,
+    /// Pre-task value snapshot, one per member (spec §3 side-effect baseline).
+    snapshot: Vec<LiteralValue>,
+    /// Most recently committed value per member.
+    last_value: Vec<LiteralValue>,
+    /// Members removed from evaluation (stamped `#CIRC!` / non-evaluable).
+    excluded: Vec<bool>,
+    /// Whether each member's committed value changed in the most recent pass.
+    changed: Vec<bool>,
+    /// Position of each member in the most recent pass (-1 = did not run).
+    pos: Vec<i64>,
+    /// Per-member live out-edges, refreshed whenever a member re-runs.
+    out_edges: Vec<Vec<u32>>,
+    /// Flattened, sorted, deduplicated live edges for one analysis pass.
+    edges: Vec<(u32, u32)>,
+    /// Live edges drained from the collector before distribution to `out_edges`.
+    drained: Vec<(u32, u32)>,
+    /// Stale readers collected for the next settle pass.
+    stale: Vec<usize>,
+    /// Live-edge collector, re-pointed at each task's membership.
+    collector: LiveEdgeCollector,
+    /// Tarjan working buffers for the live-graph classification.
+    live: LiveGraphScratch,
+}
+
 pub struct Engine<R> {
     pub(crate) graph: DependencyGraph,
     resolver: R,
@@ -508,6 +561,32 @@ pub struct Engine<R> {
     /// the next SCC task re-seed members whose overlay entry vanished.
     /// Empty unless something iterated — zero cost otherwise.
     iterative_state_values: FxHashMap<VertexId, LiteralValue>,
+
+    /// Reusable per-SCC-task working buffers (see [`SccScratch`]). Taken out
+    /// for the duration of a task and restored at the end so every SCC in a
+    /// recalc reuses one set of allocations.
+    scc_scratch: SccScratch,
+
+    /// Members of SCCs that iterated on the most recent recalc (drained from
+    /// `pending_iterative_redirty`). The value-change recalc gate must never
+    /// skip these: an iterating SCC re-evaluates every recalc regardless of
+    /// whether its inputs changed (spec §4/§7.6, Excel circular-cell parity).
+    last_iterative_members: FxHashSet<VertexId>,
+
+    /// Graph structural-mutation epoch observed at the end of the last full
+    /// recalc. The value-change gate disarms when the current epoch differs, so
+    /// structural edits applied directly on the graph (bypassing the engine's
+    /// `has_edited` signalling) are never wrongly skipped. `u64::MAX` until the
+    /// first recalc so the gate never arms on a cold engine.
+    last_recalc_structural_epoch: u64,
+
+    /// Value cells edited (via `set_cell_value`, not overwriting a formula)
+    /// since the last recalc. A pure value edit does not change any formula's
+    /// computation, so instead of disarming the value-change gate it seeds the
+    /// gate's `changed` set: the edited inputs' dependents re-evaluate while
+    /// everything else (e.g. volatile-driven phantom SCCs whose inputs are
+    /// unchanged) is skipped. Cleared at the end of each recalc.
+    edited_value_inputs: FxHashSet<VertexId>,
 
     /// FormulaPlane authority `indexes_epoch` observed by the most recent
     /// successful `evaluate_all` pass. Used to schedule whole-span work for
@@ -1504,6 +1583,10 @@ where
             last_cycle_telemetry: CycleTelemetry::default(),
             pending_iterative_redirty: Vec::new(),
             iterative_state_values: FxHashMap::default(),
+            scc_scratch: SccScratch::default(),
+            last_iterative_members: FxHashSet::default(),
+            last_recalc_structural_epoch: u64::MAX,
+            edited_value_inputs: FxHashSet::default(),
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -1583,6 +1666,10 @@ where
             last_cycle_telemetry: CycleTelemetry::default(),
             pending_iterative_redirty: Vec::new(),
             iterative_state_values: FxHashMap::default(),
+            scc_scratch: SccScratch::default(),
+            last_iterative_members: FxHashSet::default(),
+            last_recalc_structural_epoch: u64::MAX,
+            edited_value_inputs: FxHashSet::default(),
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -1667,6 +1754,11 @@ where
         if !pending.is_empty() {
             self.graph.redirty_iterative_members(&pending);
         }
+        // Remember which members iterate so the next recalc's value-change
+        // gate never skips an iterating SCC (it re-evaluates every recalc, like
+        // an Excel circular cell, even when its inputs are unchanged).
+        self.last_iterative_members.clear();
+        self.last_iterative_members.extend(pending);
     }
 
     pub fn virtual_dep_fallback_activations(&self) -> u64 {
@@ -2414,6 +2506,8 @@ where
         name: impl AsRef<str>,
         f: impl FnOnce(&mut EngineAction<'_, R>) -> Result<T, crate::engine::EditorError>,
     ) -> Result<T, crate::engine::EditorError> {
+        // Transactional edits mutate cells/formulas; disarm the value-change gate.
+        self.has_edited = true;
         if self.action_depth != 0 {
             return Err(crate::engine::EditorError::TransactionFailed {
                 reason: "Nested Engine::action calls are not supported (ticket 614: commit-only surface)"
@@ -2551,6 +2645,7 @@ where
         name: impl AsRef<str>,
         f: impl FnOnce(&mut EngineAction<'_, R>) -> Result<T, crate::engine::EditorError>,
     ) -> Result<T, crate::engine::EditorError> {
+        self.has_edited = true;
         if self.action_depth != 0 {
             return Err(crate::engine::EditorError::TransactionFailed {
                 reason: "Nested Engine::action calls are not supported (deterministic rule)"
@@ -2714,6 +2809,7 @@ where
         undo: &mut crate::engine::graph::editor::undo_engine::UndoEngine,
         log: &mut crate::engine::ChangeLog,
     ) -> Result<(), crate::engine::EditorError> {
+        self.has_edited = true;
         let batch = undo.undo(&mut self.graph, log)?;
         for item in batch.iter().rev() {
             self.apply_inverse_row_visibility_event(&item.event);
@@ -2733,6 +2829,7 @@ where
         undo: &mut crate::engine::graph::editor::undo_engine::UndoEngine,
         log: &mut crate::engine::ChangeLog,
     ) -> Result<(), crate::engine::EditorError> {
+        self.has_edited = true;
         let batch = undo.redo(&mut self.graph, log)?;
         for item in &batch {
             self.apply_forward_row_visibility_event(&item.event);
@@ -7075,6 +7172,20 @@ where
             col.saturating_sub(1),
         )
         .map_err(Self::editor_error_to_excel)?;
+        // Detect whether this overwrites a formula (a structural change that
+        // alters the cell's computation and removes dependency edges) versus a
+        // pure value edit. Only the former must disarm the value-change gate.
+        let cellref = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        let overwrote_formula = self
+            .graph
+            .get_vertex_for_cell(&cellref)
+            .map(|v| {
+                matches!(
+                    self.graph.get_vertex_kind(v),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                )
+            })
+            .unwrap_or(false);
         self.graph.set_cell_value(sheet, row, col, value.clone())?;
         self.record_formula_plane_changed_cell(sheet, row, col);
         // Mirror into Arrow overlay when enabled
@@ -7082,7 +7193,15 @@ where
         // Advance snapshot to reflect external mutation
         self.snapshot_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.has_edited = true;
+        if overwrote_formula {
+            // Structural: a formula was replaced by a value. Disarm the gate.
+            self.has_edited = true;
+        } else if let Some(v) = self.graph.get_vertex_for_cell(&cellref) {
+            // Pure value edit: seed the value-change gate so the edited input's
+            // dependents re-evaluate while unrelated unchanged work (e.g.
+            // volatile-driven phantom SCCs) is skipped — instead of disarming.
+            self.edited_value_inputs.insert(v);
+        }
         Ok(())
     }
 
@@ -8213,6 +8332,9 @@ where
         &mut self,
         targets: &[(&str, u32, u32)],
     ) -> Result<EvalResult, ExcelError> {
+        // Partial evaluation can leave SCCs un-refreshed; only a full legacy
+        // `evaluate_all` may arm the value-change skip gate.
+        self.has_edited = true;
         #[cfg(feature = "tracing")]
         let _span_eval = tracing::info_span!("evaluate_until", targets = targets.len()).entered();
         let start = crate::instant::FzInstant::now();
@@ -8318,6 +8440,7 @@ where
         targets: &[(&str, u32, u32)],
         delta: &mut DeltaCollector,
     ) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         #[cfg(feature = "tracing")]
         let _span_eval =
             tracing::info_span!("evaluate_until_with_delta", targets = targets.len()).entered();
@@ -8419,6 +8542,7 @@ where
 
     /// Evaluate using a previously constructed plan. This avoids rebuilding layer schedules for each run.
     pub fn evaluate_recalc_plan(&mut self, plan: &RecalcPlan) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         self.validate_deterministic_mode()?;
@@ -8500,6 +8624,9 @@ where
         })
     }
     fn evaluate_authoritative_formula_plane_all(&mut self) -> Result<EvalResult, ExcelError> {
+        // The value-change skip gate is armed only by the legacy full-recalc
+        // path; disarm it here so a FormulaPlane recalc never leaves it armed.
+        self.has_edited = true;
         // Fresh per-request cycle counters. Some callers (`evaluate_vertex`,
         // `evaluate_cells*`) reach this coordinator without an entry-point
         // reset; callers that did reset have accumulated nothing in between,
@@ -9026,22 +9153,90 @@ where
     fn legacy_pass_run_units(
         &mut self,
         schedule: &crate::engine::scheduler::Schedule,
+        gate_eligible: bool,
     ) -> Result<(usize, usize), ExcelError> {
         let mut computed_vertices = 0;
         let mut cycle_count = 0;
+        // Value-change recalc gate (armed only on an edit-free recalc). A
+        // formula's value is a deterministic function of its inputs, so on a
+        // recalc with no edits a vertex can only change if one of its
+        // dependencies changed value this pass (or it is volatile/dynamic).
+        // Walking units in condensation order, `changed` accumulates the
+        // vertices whose value actually changed; any vertex (or whole SCC)
+        // whose inputs are all unchanged is skipped, keeping its committed
+        // overlay value. This collapses the common volatile-guard phantom
+        // pattern — a volatile re-dirties the whole sheet every recalc, yet
+        // nothing downstream actually changes — from a full recompute to
+        // re-evaluating just the volatiles. Disarmed by any edit
+        // (`mark_data_edited`/`mark_topology_edited`) or partial evaluation.
+        let gate_armed = gate_eligible
+            && self.config.value_change_gate_enabled
+            && !self.has_edited
+            && !self.graph.has_external_sources()
+            && self.graph.structural_epoch() == self.last_recalc_structural_epoch;
+        let mut changed: FxHashSet<VertexId> = FxHashSet::default();
+        if gate_armed {
+            // Pure value edits since the last recalc are the inputs that
+            // changed: seed them so their dependents re-evaluate (everything
+            // else with unchanged inputs is skipped).
+            changed.extend(self.edited_value_inputs.iter().copied());
+        }
+        let mut old_values: Vec<LiteralValue> = Vec::new();
         for &unit in &schedule.units {
             match unit {
                 ScheduleUnit::Cycle(i) => {
-                    if self.handle_cycle_unit(schedule.unit_cycle(i), None, None, None)? > 0 {
+                    let cycle = schedule.unit_cycle(i);
+                    if gate_armed && !self.scc_unit_must_eval(cycle, &changed) {
+                        continue; // inputs unchanged ⇒ committed values still hold
+                    }
+                    if gate_armed {
+                        old_values.clear();
+                        old_values.extend(cycle.iter().map(|&v| self.read_vertex_committed_value(v)));
+                    }
+                    if self.handle_cycle_unit(cycle, None, None, None)? > 0 {
                         cycle_count += 1;
+                    }
+                    if gate_armed {
+                        for (idx, &v) in cycle.iter().enumerate() {
+                            if self.read_vertex_committed_value(v) != old_values[idx] {
+                                changed.insert(v);
+                            }
+                        }
                     }
                 }
                 ScheduleUnit::Layer(i) => {
                     let layer = schedule.unit_layer(i);
-                    if self.thread_pool.is_some() && layer.vertices.len() > 1 {
-                        computed_vertices += self.evaluate_layer_parallel(layer)?;
+                    if !gate_armed {
+                        if self.thread_pool.is_some() && layer.vertices.len() > 1 {
+                            computed_vertices += self.evaluate_layer_parallel(layer)?;
+                        } else {
+                            computed_vertices += self.evaluate_layer_sequential(layer)?;
+                        }
+                        continue;
+                    }
+                    // Gated: evaluate only the vertices whose inputs changed
+                    // (or that must always run), then record which changed.
+                    let subset: Vec<VertexId> = layer
+                        .vertices
+                        .iter()
+                        .copied()
+                        .filter(|&v| self.vertex_must_eval(v, &changed))
+                        .collect();
+                    if subset.is_empty() {
+                        continue;
+                    }
+                    old_values.clear();
+                    old_values.extend(subset.iter().map(|&v| self.read_vertex_committed_value(v)));
+                    let sub_layer = super::scheduler::Layer { vertices: subset };
+                    if self.thread_pool.is_some() && sub_layer.vertices.len() > 1 {
+                        computed_vertices += self.evaluate_layer_parallel(&sub_layer)?;
                     } else {
-                        computed_vertices += self.evaluate_layer_sequential(layer)?;
+                        computed_vertices += self.evaluate_layer_sequential(&sub_layer)?;
+                    }
+                    for (idx, &v) in sub_layer.vertices.iter().enumerate() {
+                        if self.read_vertex_committed_value(v) != old_values[idx] {
+                            changed.insert(v);
+                        }
                     }
                 }
             }
@@ -9060,6 +9255,90 @@ where
     /// counts (G8 demotion path), and both sub-passes belong to ONE request /
     /// one clock sample; request begin happens at the public entry points /
     /// coordinators instead.
+    /// Read a vertex's currently-committed value the way a reader would see it:
+    /// overlay-first for cells (the value home in canonical mode), graph value
+    /// map otherwise. Used by the value-change recalc gate.
+    fn read_vertex_committed_value(&self, vertex: VertexId) -> LiteralValue {
+        if let Some(cell) = self.graph.get_cell_ref(vertex) {
+            let sheet_name = self.graph.sheet_name(cell.sheet_id);
+            self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                .unwrap_or(LiteralValue::Empty)
+        } else {
+            self.graph.get_value(vertex).unwrap_or(LiteralValue::Empty)
+        }
+    }
+
+    /// Whether a vertex that is forced to always re-evaluate under the
+    /// value-change gate (regardless of input changes): volatile/dynamic
+    /// functions (their value is not a pure function of tracked inputs),
+    /// non-scalar formulas (arrays/spill — their effect is not captured by a
+    /// scalar value compare), spill anchors, and range readers (range cell
+    /// changes are not enumerated as vertex deps).
+    fn vertex_always_reeval(&self, v: VertexId) -> bool {
+        if !matches!(self.graph.get_vertex_kind(v), VertexKind::FormulaScalar) {
+            return true;
+        }
+        self.graph.is_volatile(v)
+            || self.graph.is_dynamic(v)
+            || self.graph.get_range_dependencies(v).is_some()
+            || self.graph.spill_cells_for_anchor(v).is_some()
+            // Defined-name dependencies resolve outside the layer walk, so a
+            // name consumer's input change is not visible via `changed`; always
+            // re-evaluate it (named-range readers are rare). This keeps the gate
+            // correct without modelling the name dependency mechanism.
+            || self
+                .graph
+                .names_referenced_by(v)
+                .is_some_and(|names| !names.is_empty())
+    }
+
+    /// Gate decision for one layer vertex: evaluate iff it must always run or a
+    /// dependency changed value this pass. A dependency that no longer exists
+    /// (e.g. a tombstoned cross-sheet ref after the target sheet was removed)
+    /// also forces re-evaluation — its disappearance changes the result.
+    fn vertex_must_eval(&self, v: VertexId, changed: &FxHashSet<VertexId>) -> bool {
+        if self.vertex_always_reeval(v) {
+            return true;
+        }
+        if let Some(deps) = self.graph.dependencies_slice(v) {
+            deps.iter()
+                .any(|d| changed.contains(d) || !self.graph.vertex_exists(*d))
+        } else {
+            self.graph
+                .get_dependencies(v)
+                .iter()
+                .any(|d| changed.contains(d) || !self.graph.vertex_exists(*d))
+        }
+    }
+
+    /// Gate decision for one `Cycle` unit: evaluate iff any member must always
+    /// run, any member iterates, or any external dependency changed this pass.
+    fn scc_unit_must_eval(&self, cycle: &[VertexId], changed: &FxHashSet<VertexId>) -> bool {
+        for &member in cycle {
+            if self.vertex_always_reeval(member) || self.last_iterative_members.contains(&member) {
+                return true;
+            }
+        }
+        for &member in cycle {
+            if let Some(deps) = self.graph.dependencies_slice(member) {
+                if deps
+                    .iter()
+                    .any(|dep| !cycle.contains(dep) && changed.contains(dep))
+                {
+                    return true;
+                }
+            } else if self
+                .graph
+                .get_dependencies(member)
+                .iter()
+                .any(|dep| !cycle.contains(dep) && changed.contains(dep))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn evaluate_all_legacy_impl(&mut self) -> Result<EvalResult, ExcelError> {
         self.reset_virtual_dep_telemetry_if_disabled();
         #[cfg(feature = "tracing")]
@@ -9090,7 +9369,12 @@ where
                 Self::accumulate_schedule_meta(t, &meta);
             }
 
-            let (pass_computed, pass_cycles) = self.legacy_pass_run_units(&schedule)?;
+            // The value-change skip gate is gated further inside on edit-free /
+            // structurally-stable / source-free state; only the very first
+            // recalc (no prior committed values) is excluded here.
+            let gate_eligible = self.recalc_epoch > 0;
+            let (pass_computed, pass_cycles) =
+                self.legacy_pass_run_units(&schedule, gate_eligible)?;
             computed_vertices += pass_computed;
             cycle_errors += pass_cycles;
 
@@ -9132,6 +9416,16 @@ where
         // Advance recalc epoch after a full evaluation pass finishes
         self.recalc_epoch = self.recalc_epoch.wrapping_add(1);
 
+        // A full recalc brought every dirty vertex to a consistent value, so a
+        // subsequent recalc with no intervening edit and no structural mutation
+        // is "pure" and the value-change gate may arm. Any edit re-sets
+        // `has_edited`; direct-on-graph structural edits bump `structural_epoch`.
+        self.has_edited = false;
+        self.last_recalc_structural_epoch = self.graph.structural_epoch();
+        // Edited value inputs were consumed (seeded into this recalc's change
+        // set); reset so the next recalc only sees fresh edits.
+        self.edited_value_inputs.clear();
+
         Ok(EvalResult {
             computed_vertices,
             cycle_errors,
@@ -9149,6 +9443,7 @@ where
         &mut self,
         delta: &mut DeltaCollector,
     ) -> Result<EvalResult, ExcelError> {
+        self.has_edited = true;
         self.begin_evaluation_request();
         let _source_cache = self.source_cache_session();
         if self.config.defer_graph_building {
@@ -12420,20 +12715,33 @@ where
         mut delta: Option<&mut DeltaCollector>,
         cancel_flag: Option<&AtomicBool>,
     ) -> Result<usize, ExcelError> {
-        struct SccMember {
-            vertex: VertexId,
-            cell: Option<CellRef>,
-        }
-
         let task_start = crate::instant::FzInstant::now();
+
+        // Borrow the engine's reusable SCC working buffers for this task. They
+        // are restored at the end (Ok path); the only early exits are `?` on
+        // cancellation, which aborts the whole evaluation, so dropping the
+        // scratch there is harmless (it reallocates if evaluation resumes).
+        let mut scratch = std::mem::take(&mut self.scc_scratch);
+        // Take the member-classification Vecs out as locals so the ordering
+        // code below reads exactly as before; their allocations are reused
+        // across tasks and restored at the end.
+        let mut cell_members = std::mem::take(&mut scratch.cell_members);
+        let mut name_members = std::mem::take(&mut scratch.name_members);
+        let mut other_members = std::mem::take(&mut scratch.other_members);
+        let mut cell_refs = std::mem::take(&mut scratch.cell_refs);
+        let mut name_keys = std::mem::take(&mut scratch.name_keys);
+        let mut members = std::mem::take(&mut scratch.members);
+        cell_members.clear();
+        name_members.clear();
+        other_members.clear();
+        cell_refs.clear();
+        name_keys.clear();
+        members.clear();
 
         // ── 0. Member order (spec §7.13): cells ascending (sheet, row, col);
         // name vertices after, lexicographic by folded canonical name; any
         // other vertex kind (defensive — `get_evaluation_vertices` only emits
         // formula/name kinds) last by id, never evaluated.
-        let mut cell_members: Vec<(VertexId, CellRef)> = Vec::new();
-        let mut name_members: Vec<(VertexId, String)> = Vec::new();
-        let mut other_members: Vec<VertexId> = Vec::new();
         for &v in cycle {
             match self.graph.get_vertex_kind(v) {
                 VertexKind::FormulaScalar | VertexKind::FormulaArray => {
@@ -12455,9 +12763,9 @@ where
         name_members.sort_unstable_by(|(av, ak), (bv, bk)| ak.cmp(bk).then(av.cmp(bv)));
         other_members.sort_unstable();
 
-        let cell_refs: Vec<CellRef> = cell_members.iter().map(|(_, c)| *c).collect();
-        let name_keys: Vec<String> = name_members.iter().map(|(_, k)| k.clone()).collect();
-        let mut members: Vec<SccMember> = Vec::with_capacity(cycle.len());
+        cell_refs.extend(cell_members.iter().map(|(_, c)| *c));
+        name_keys.extend(name_members.iter().map(|(_, k)| k.clone()));
+        members.reserve(cycle.len());
         for (v, c) in &cell_members {
             members.push(SccMember {
                 vertex: *v,
@@ -12520,9 +12828,10 @@ where
 
         // ── 1. Pre-task value snapshot (overlay-first for cells — G3; the
         // graph value map may be evicted in value-cache-disabled mode).
-        let snapshot: Vec<LiteralValue> = members
-            .iter()
-            .map(|m| match m.cell {
+        scratch.snapshot.clear();
+        scratch.snapshot.reserve(n);
+        for m in &members {
+            let value = match m.cell {
                 Some(cell) => {
                     let sheet_name = self.graph.sheet_name(cell.sheet_id);
                     self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
@@ -12532,15 +12841,18 @@ where
                     .graph
                     .get_value(m.vertex)
                     .unwrap_or(LiteralValue::Empty),
-            })
-            .collect();
+            };
+            scratch.snapshot.push(value);
+        }
 
         // ── 2. Pre-scan: spill anchors (FormulaArray) are stamped `#CIRC!`
         // with full spill teardown (spec §7.9, #115) and excluded from
         // evaluation. They stay recordable edge TARGETS (readers see `#CIRC!`
         // and propagate). Non-evaluable defensive members are excluded too.
-        let mut excluded = vec![false; n];
-        let mut last_value = snapshot.clone();
+        scratch.excluded.clear();
+        scratch.excluded.resize(n, false);
+        scratch.last_value.clear();
+        scratch.last_value.extend_from_slice(&scratch.snapshot);
         let mut stamped = 0usize;
         for (i, m) in members.iter().enumerate() {
             match self.graph.get_vertex_kind(m.vertex) {
@@ -12549,23 +12861,28 @@ where
                     // can only be recorded here; the anchor's own delta is
                     // covered by the end-of-task snapshot comparison (dedup).
                     self.stamp_cycle_error(m.vertex, &circ_error, delta.as_deref_mut());
-                    excluded[i] = true;
-                    last_value[i] = circ_error.clone();
+                    scratch.excluded[i] = true;
+                    scratch.last_value[i] = circ_error.clone();
                     stamped += 1;
                 }
                 VertexKind::FormulaScalar | VertexKind::NamedScalar | VertexKind::NamedArray => {}
-                _ => excluded[i] = true,
+                _ => scratch.excluded[i] = true,
             }
         }
 
-        let collector = LiveEdgeCollector::new_with_names(&cell_refs, &name_keys);
+        scratch.collector.reset_with_names(&cell_refs, &name_keys);
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
-        let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
+        scratch.out_edges.resize_with(n, Vec::new);
+        for edges in scratch.out_edges.iter_mut() {
+            edges.clear();
+        }
         // Position of each member in the most recent pass (-1 = did not run).
-        let mut pos: Vec<i64> = vec![-1; n];
+        scratch.pos.clear();
+        scratch.pos.resize(n, -1);
         // Whether each member's committed value changed in the most recent pass.
-        let mut changed = vec![false; n];
+        scratch.changed.clear();
+        scratch.changed.resize(n, false);
 
         // Evaluate-and-commit one member; returns Ok(true) when the member was
         // stamped `#CIRC!` (array result — would-be spill anchor, spec §7.9).
@@ -12574,11 +12891,11 @@ where
                 let i: usize = $i;
                 let m = &members[i];
                 if i < recordable {
-                    collector.set_current(i as u32);
+                    scratch.collector.set_current(i as u32);
                 }
                 let value = {
-                    let ctx = RecordingContext::new(&*self, &collector);
-                    match self.evaluate_vertex_recorded(m.vertex, &ctx, &collector) {
+                    let ctx = RecordingContext::new(&*self, &scratch.collector);
+                    match self.evaluate_vertex_recorded(m.vertex, &ctx, &scratch.collector) {
                         Ok(v) => v,
                         Err(e) => LiteralValue::Error(e),
                     }
@@ -12590,13 +12907,27 @@ where
                     // (a prior spill would make it FormulaArray, pre-stamped
                     // above), so there is no projection to tear down.
                     self.stamp_cycle_error(m.vertex, &circ_error, None);
-                    excluded[i] = true;
+                    scratch.excluded[i] = true;
                     stamped += 1;
-                    changed[i] = last_value[i] != circ_error;
-                    last_value[i] = circ_error.clone();
+                    scratch.changed[i] = scratch.last_value[i] != circ_error;
+                    scratch.last_value[i] = circ_error.clone();
                 } else {
+                    let value_changed = scratch.last_value[i] != value;
                     self.graph.update_vertex_value(m.vertex, value.clone());
-                    self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    // Skip the computed-overlay write when the value is
+                    // unchanged. The computed overlay is the value home in
+                    // canonical mode, and the invariant `overlay[i] ==
+                    // last_value[i]` is maintained across passes: `last_value`
+                    // starts at the snapshot (the current overlay value) and
+                    // the overlay is rewritten exactly when `last_value`
+                    // changes, so an unchanged value means the overlay already
+                    // holds it and the write is pure churn. This is the
+                    // dominant per-member commit cost on volatile-but-stable
+                    // workloads (a volatile guard re-dirties every member every
+                    // recalc, yet the resolved values never change).
+                    if value_changed {
+                        self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    }
                     // §7.14 invariant (G2): a formula member must never be
                     // shadowed by a user/delta overlay entry, or iteration
                     // reads would silently diverge from committed values.
@@ -12615,8 +12946,8 @@ where
                             cell.coord.col() + 1
                         );
                     }
-                    changed[i] = last_value[i] != value;
-                    last_value[i] = value;
+                    scratch.changed[i] = value_changed;
+                    scratch.last_value[i] = value;
                 }
             }};
         }
@@ -12637,11 +12968,11 @@ where
         {
             let mut p = 0i64;
             for i in 0..n {
-                if excluded[i] {
+                if scratch.excluded[i] {
                     continue;
                 }
                 run_member!(i);
-                pos[i] = p;
+                scratch.pos[i] = p;
                 p += 1;
             }
         }
@@ -12683,38 +13014,50 @@ where
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
-            let drained = collector.take_edges();
+            scratch.drained.clear();
+            scratch.collector.drain_edges_into(&mut scratch.drained);
             for i in 0..n {
-                if pos[i] >= 0 {
-                    out_edges[i].clear();
+                if scratch.pos[i] >= 0 {
+                    scratch.out_edges[i].clear();
                 }
             }
-            for (from, to) in drained {
+            for k in 0..scratch.drained.len() {
+                let (from, to) = scratch.drained[k];
                 debug_assert!(
-                    pos[from as usize] >= 0,
+                    scratch.pos[from as usize] >= 0,
                     "edge from a member that did not run"
                 );
-                out_edges[from as usize].push(to);
+                scratch.out_edges[from as usize].push(to);
             }
-            let mut edges: Vec<(u32, u32)> = Vec::new();
-            for (i, outs) in out_edges.iter().enumerate() {
-                if excluded[i] {
+            scratch.edges.clear();
+            for (i, outs) in scratch.out_edges.iter().enumerate() {
+                if scratch.excluded[i] {
                     continue;
                 }
                 for &t in outs {
-                    edges.push((i as u32, t));
+                    scratch.edges.push((i as u32, t));
                 }
             }
-            edges.sort_unstable();
-            edges.dedup();
+            scratch.edges.sort_unstable();
+            scratch.edges.dedup();
 
-            let analysis = analyze_live_graph(n, &edges);
+            // No live edges among members ⇒ no live cycle is possible and no
+            // member can be a stale reader (staleness requires reading another
+            // member). This is the common phantom shape — a guard cuts every
+            // intra-SCC reference — so short-circuit before the Tarjan
+            // classification and the stale-reader scan, both of which would be
+            // no-ops here. Equivalent to the acyclic-with-no-stale path below.
+            if scratch.edges.is_empty() {
+                break;
+            }
 
-            if analysis.cycle_count > 0 {
+            analyze_live_graph_into(&mut scratch.live, n, &scratch.edges);
+
+            if scratch.live.cycle_count > 0 {
                 // Classification repeats every iteration pass under
                 // `Iterate`; record the widest single witness instead of
                 // accumulating so the count stays "distinct live cycles".
-                witnessed_cycles = witnessed_cycles.max(analysis.cycle_count);
+                witnessed_cycles = witnessed_cycles.max(scratch.live.cycle_count);
                 match policy {
                     CyclePolicy::Error => {
                         // POLICY (Error): stamp every member of a live cycle,
@@ -12723,19 +13066,20 @@ where
                         // downstream is consistent (spec §3.4). Blast radius =
                         // live cycles only.
                         for i in 0..n {
-                            if analysis.in_cycle[i] && !excluded[i] {
+                            if scratch.live.in_cycle[i] && !scratch.excluded[i] {
                                 self.stamp_cycle_error(members[i].vertex, &circ_error, None);
-                                excluded[i] = true;
-                                last_value[i] = circ_error.clone();
+                                scratch.excluded[i] = true;
+                                scratch.last_value[i] = circ_error.clone();
                                 stamped += 1;
                             }
                         }
                         check_cancel(cancel_flag)?;
-                        let order: Vec<usize> = analysis
+                        let order: Vec<usize> = scratch
+                            .live
                             .topo
                             .iter()
                             .map(|&i| i as usize)
-                            .filter(|&i| !excluded[i])
+                            .filter(|&i| !scratch.excluded[i])
                             .collect();
                         if !order.is_empty() {
                             passes += 1;
@@ -12762,7 +13106,7 @@ where
                             let mut round_nan = 0usize;
                             let mut all_converged = true;
                             for i in 0..n {
-                                if excluded[i] {
+                                if scratch.excluded[i] {
                                     // Stamped mid-iteration (array result,
                                     // §7.9): the value is pinned and cannot
                                     // change again — trivially settled.
@@ -12770,7 +13114,7 @@ where
                                 }
                                 let out = crate::engine::convergence::values_converged(
                                     &prev[i],
-                                    &last_value[i],
+                                    &scratch.last_value[i],
                                     max_change,
                                     self.config.date_system,
                                 );
@@ -12818,19 +13162,19 @@ where
                         // (§7.3) — so classification repeats next time
                         // around, and a cycle that dissolves drops back to
                         // the exact acyclic settle below.
-                        prev_pass = Some(last_value.clone());
-                        for x in pos.iter_mut() {
+                        prev_pass = Some(scratch.last_value.clone());
+                        for x in scratch.pos.iter_mut() {
                             *x = -1;
                         }
-                        changed.fill(false);
+                        scratch.changed.fill(false);
                         passes += 1;
                         let mut p = 0i64;
                         for i in 0..n {
-                            if excluded[i] {
+                            if scratch.excluded[i] {
                                 continue;
                             }
                             run_member!(i);
-                            pos[i] = p;
+                            scratch.pos[i] = p;
                             p += 1;
                         }
                         continue;
@@ -12840,30 +13184,31 @@ where
 
             // Acyclic: find stale readers — members whose live read of `to`
             // happened before `to`'s value changed in the pass that just ran.
-            let mut stale: Vec<usize> = Vec::new();
+            scratch.stale.clear();
             for i in 0..n {
-                if excluded[i] {
+                if scratch.excluded[i] {
                     continue;
                 }
-                let is_stale = out_edges[i].iter().any(|&t| {
+                let is_stale = scratch.out_edges[i].iter().any(|&t| {
                     let t = t as usize;
-                    changed[t] && (pos[i] < 0 || (pos[t] >= 0 && pos[i] < pos[t]))
+                    scratch.changed[t]
+                        && (scratch.pos[i] < 0 || (scratch.pos[t] >= 0 && scratch.pos[i] < scratch.pos[t]))
                 });
                 if is_stale {
-                    stale.push(i);
+                    scratch.stale.push(i);
                 }
             }
-            if stale.is_empty() {
+            if scratch.stale.is_empty() {
                 break; // values exact — phantom SCC (or dissolved live cycle)
             }
             if 1 + settle_passes >= cap {
                 // Defensive only; hitting this is a bug (loud telemetry).
                 capped = true;
                 for (i, m) in members.iter().enumerate() {
-                    if !excluded[i] {
+                    if !scratch.excluded[i] {
                         self.stamp_cycle_error(m.vertex, &circ_error, None);
-                        excluded[i] = true;
-                        last_value[i] = circ_error.clone();
+                        scratch.excluded[i] = true;
+                        scratch.last_value[i] = circ_error.clone();
                         stamped += 1;
                     }
                 }
@@ -12878,17 +13223,22 @@ where
             // so a live cycle (re)appearing afterwards never compares values
             // across mixed pass kinds.
             prev_pass = None;
-            let topo_pos = analysis.topo_positions();
-            stale.sort_unstable_by_key(|&i| topo_pos[i]);
-            for x in pos.iter_mut() {
+            let topo_pos = scratch.live.topo_positions();
+            scratch.stale.sort_unstable_by_key(|&i| topo_pos[i]);
+            for x in scratch.pos.iter_mut() {
                 *x = -1;
             }
-            changed.fill(false);
+            scratch.changed.fill(false);
             passes += 1;
             settle_passes += 1;
-            for (p, i) in stale.into_iter().enumerate() {
+            // Index walk (not `drain`) keeps `scratch.stale`'s allocation for
+            // the next task while letting `run_member!` mutate the other
+            // scratch buffers without holding a borrow on it.
+            let stale_len = scratch.stale.len();
+            for p in 0..stale_len {
+                let i = scratch.stale[p];
                 run_member!(i);
-                pos[i] = p as i64;
+                scratch.pos[i] = p as i64;
             }
         }
 
@@ -12902,13 +13252,13 @@ where
 
         // ── 5. End of task: one delta per member whose final value differs
         // from the pre-task snapshot (spec §3 side-effect rule, G11).
-        collector.clear_current();
+        scratch.collector.clear_current();
         if let Some(d) = delta
             && d.mode != DeltaMode::Off
         {
             for (i, m) in members.iter().enumerate() {
                 if let Some(cell) = m.cell
-                    && last_value[i] != snapshot[i]
+                    && scratch.last_value[i] != scratch.snapshot[i]
                 {
                     d.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
                 }
@@ -12949,6 +13299,15 @@ where
             }
             t.elapsed_ms += task_start.elapsed().as_millis();
         }
+
+        // Return the working buffers to the engine for the next SCC task.
+        scratch.cell_members = cell_members;
+        scratch.name_members = name_members;
+        scratch.other_members = other_members;
+        scratch.cell_refs = cell_refs;
+        scratch.name_keys = name_keys;
+        scratch.members = members;
+        self.scc_scratch = scratch;
 
         Ok(stamped)
     }

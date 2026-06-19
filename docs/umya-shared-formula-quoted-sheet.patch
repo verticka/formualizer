@@ -1,0 +1,116 @@
+From 4226fe3d8f658d1887477805743b73b943dc76cd Mon Sep 17 00:00:00 2001
+From: Verticka <verticka@gmail.com>
+Date: Fri, 19 Jun 2026 13:08:11 +0000
+Subject: [PATCH] fix: preserve quoted sheet refs in shared-formula expansion
+
+A shared formula whose master references a sheet that needs quoting
+(e.g. '(1)'!$E$38) was corrupted during shared-formula expansion:
+parse_to_tokens treated the opening single quote as a string start and
+dropped the surrounding quotes, and join_address never re-added them,
+yielding the invalid (1)!$E$38 which fails to parse.
+
+- parse_to_tokens: treat a leading single quote as a sheet path (not a
+  string) and preserve the surrounding quotes.
+- join_address: re-quote sheet names that are not bare identifiers
+  (empty, leading digit, or containing non-identifier chars), doubling
+  internal single quotes to match Excel quoting.
+
+Adds two regression tests covering token round-trip and shared-formula
+coordinate adjustment.
+---
+ src/helper/address.rs | 16 +++++++++++++++-
+ src/helper/formula.rs | 40 +++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/src/helper/address.rs b/src/helper/address.rs
+index 69de88d..6a41166 100644
+--- a/src/helper/address.rs
++++ b/src/helper/address.rs
+@@ -11,7 +11,21 @@ pub fn join_address(sheet_name: &str, address: &str) -> String {
+     if sheet_name == "" {
+         return address.to_string();
+     }
+-    format!("{}!{}", sheet_name, address)
++    // `split_address` strips surrounding quotes for name comparison; re-add
++    // them here when the sheet name is not a bare identifier (contains spaces
++    // or special characters, or starts with a digit) so the rendered formula
++    // stays valid (e.g. `'(1)'!$E$38`, not `(1)!$E$38`). Internal single
++    // quotes are doubled, matching Excel quoting.
++    let needs_quoting = sheet_name.is_empty()
++        || sheet_name.starts_with(|c: char| c.is_ascii_digit())
++        || !sheet_name
++            .chars()
++            .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
++    if needs_quoting {
++        format!("'{}'!{}", sheet_name.replace('\'', "''"), address)
++    } else {
++        format!("{}!{}", sheet_name, address)
++    }
+ }
+ 
+ #[test]
+diff --git a/src/helper/formula.rs b/src/helper/formula.rs
+index cabee04..19a097f 100644
+--- a/src/helper/formula.rs
++++ b/src/helper/formula.rs
+@@ -179,6 +179,9 @@ pub(crate) fn parse_to_tokens<S: Into<String>>(formula: S) -> Vec<FormulaToken>
+                     value = format!("{}{}", value, self::QUOTE_SINGLE);
+                     index += 1;
+                 } else {
++                    // Preserve the closing quote of the quoted sheet path so
++                    // re-serialization keeps `'Sheet Name'!A1` intact.
++                    value = format!("{}{}", value, self::QUOTE_SINGLE);
+                     in_path = false;
+                 }
+             } else {
+@@ -262,7 +265,9 @@ pub(crate) fn parse_to_tokens<S: Into<String>>(formula: S) -> Vec<FormulaToken>
+                 tokens1.push(obj);
+                 value = String::new();
+             }
+-            in_string = true;
++            in_path = true;
++            // Preserve the opening quote of the quoted sheet path.
++            value = format!("{}{}", value, self::QUOTE_SINGLE);
+             index += 1;
+ 
+             continue;
+@@ -990,3 +995,36 @@ mod tests {
+         );
+     }
+ }
++
++#[cfg(test)]
++mod shared_formula_quoted_sheet_tests {
++    use super::*;
++
++    // Regression: a single-quoted sheet reference inside a formula with string
++    // literals must survive parse_to_tokens -> render unchanged. Before the fix
++    // the leading `'` was treated as a double-quoted string start, corrupting
++    // everything after it.
++    #[test]
++    fn quoted_sheet_ref_round_trips() {
++        let f = r#"IF(A2=1,'(1)'!$E$38&"-x","")"#;
++        let tokens = parse_to_tokens(format!("={}", f));
++        let rendered = render(&tokens);
++        assert_eq!(rendered, f, "render lost/corrupted the quoted sheet reference");
++    }
++
++    // Regression: shared-formula coordinate adjustment must preserve the quoted
++    // sheet name (it must NOT emit `(1)!$E$38`, which is invalid).
++    #[test]
++    fn shared_adjustment_preserves_quoted_sheet() {
++        let mut tokens = parse_to_tokens(r#"=IF(A2=1,'(1)'!$E$38&"-x","")"#);
++        // Simulate expanding the shared master (row 2) down to row 3.
++        let out = adjustment_insert_formula_coordinate(
++            &mut tokens, &0, &0, &2, &1, "", "Main", true,
++        );
++        assert!(
++            out.contains("'(1)'!$E$38"),
++            "quoted sheet ref was corrupted on shared expansion: {out}"
++        );
++        assert!(!out.contains("(1)!$E$38"), "sheet name lost its quotes: {out}");
++    }
++}
+-- 
+2.43.0
+
