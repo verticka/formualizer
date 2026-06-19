@@ -93,6 +93,10 @@ fn main() -> anyhow::Result<()> {
                 format!("A{row}+B{row}")
             });
         }
+        // A plain value input (col 5 = E1) and one formula reading it (E2):
+        // editing E1 should recalc only E2, skipping every phantom SCC.
+        sheet.get_cell_mut((5, 1)).set_value_number(1.0);
+        sheet.get_cell_mut((5, 2)).set_formula("E1*2".to_string());
     });
 
     let mut config = WorkbookConfig::ephemeral();
@@ -112,6 +116,21 @@ fn main() -> anyhow::Result<()> {
         let tel = wb.engine().last_cycle_telemetry().clone();
         println!(
             "[{mode}] pass={pass} eval_ms={ms:.1} computed={} us_per_computed={per:.3} phantom_sccs={}",
+            res.computed_vertices, tel.phantom_sccs
+        );
+    }
+
+    // Interactive scenario: edit ONE plain value (E1) and time the recalc.
+    for round in 0..3 {
+        wb.set_value("Sheet1", 1, 5, formualizer_workbook::LiteralValue::Number(round as f64 + 2.0))
+            .map_err(|e| anyhow::anyhow!("set_value E1: {e}"))?;
+        let t = Instant::now();
+        let res = wb.evaluate_all().map_err(|e| anyhow::anyhow!("recalc: {e}"))?;
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let tel = wb.engine().last_cycle_telemetry().clone();
+        let e2 = wb.get_value("Sheet1", 2, 5);
+        println!(
+            "[{mode}] edit E1 round={round} recalc_ms={ms:.1} computed={} phantom_sccs={} E2={e2:?}",
             res.computed_vertices, tel.phantom_sccs
         );
     }

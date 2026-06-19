@@ -580,6 +580,14 @@ pub struct Engine<R> {
     /// first recalc so the gate never arms on a cold engine.
     last_recalc_structural_epoch: u64,
 
+    /// Value cells edited (via `set_cell_value`, not overwriting a formula)
+    /// since the last recalc. A pure value edit does not change any formula's
+    /// computation, so instead of disarming the value-change gate it seeds the
+    /// gate's `changed` set: the edited inputs' dependents re-evaluate while
+    /// everything else (e.g. volatile-driven phantom SCCs whose inputs are
+    /// unchanged) is skipped. Cleared at the end of each recalc.
+    edited_value_inputs: FxHashSet<VertexId>,
+
     /// FormulaPlane authority `indexes_epoch` observed by the most recent
     /// successful `evaluate_all` pass. Used to schedule whole-span work for
     /// any active span the engine has not yet evaluated under the current
@@ -1578,6 +1586,7 @@ where
             scc_scratch: SccScratch::default(),
             last_iterative_members: FxHashSet::default(),
             last_recalc_structural_epoch: u64::MAX,
+            edited_value_inputs: FxHashSet::default(),
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -1660,6 +1669,7 @@ where
             scc_scratch: SccScratch::default(),
             last_iterative_members: FxHashSet::default(),
             last_recalc_structural_epoch: u64::MAX,
+            edited_value_inputs: FxHashSet::default(),
             formula_plane_indexes_epoch_seen: 0,
             #[cfg(test)]
             last_formula_plane_span_eval_report: None,
@@ -7162,6 +7172,20 @@ where
             col.saturating_sub(1),
         )
         .map_err(Self::editor_error_to_excel)?;
+        // Detect whether this overwrites a formula (a structural change that
+        // alters the cell's computation and removes dependency edges) versus a
+        // pure value edit. Only the former must disarm the value-change gate.
+        let cellref = CellRef::new(sheet_id, Coord::from_excel(row, col, true, true));
+        let overwrote_formula = self
+            .graph
+            .get_vertex_for_cell(&cellref)
+            .map(|v| {
+                matches!(
+                    self.graph.get_vertex_kind(v),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                )
+            })
+            .unwrap_or(false);
         self.graph.set_cell_value(sheet, row, col, value.clone())?;
         self.record_formula_plane_changed_cell(sheet, row, col);
         // Mirror into Arrow overlay when enabled
@@ -7169,7 +7193,15 @@ where
         // Advance snapshot to reflect external mutation
         self.snapshot_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.has_edited = true;
+        if overwrote_formula {
+            // Structural: a formula was replaced by a value. Disarm the gate.
+            self.has_edited = true;
+        } else if let Some(v) = self.graph.get_vertex_for_cell(&cellref) {
+            // Pure value edit: seed the value-change gate so the edited input's
+            // dependents re-evaluate while unrelated unchanged work (e.g.
+            // volatile-driven phantom SCCs) is skipped — instead of disarming.
+            self.edited_value_inputs.insert(v);
+        }
         Ok(())
     }
 
@@ -9143,6 +9175,12 @@ where
             && !self.graph.has_external_sources()
             && self.graph.structural_epoch() == self.last_recalc_structural_epoch;
         let mut changed: FxHashSet<VertexId> = FxHashSet::default();
+        if gate_armed {
+            // Pure value edits since the last recalc are the inputs that
+            // changed: seed them so their dependents re-evaluate (everything
+            // else with unchanged inputs is skipped).
+            changed.extend(self.edited_value_inputs.iter().copied());
+        }
         let mut old_values: Vec<LiteralValue> = Vec::new();
         for &unit in &schedule.units {
             match unit {
@@ -9244,6 +9282,14 @@ where
             || self.graph.is_dynamic(v)
             || self.graph.get_range_dependencies(v).is_some()
             || self.graph.spill_cells_for_anchor(v).is_some()
+            // Defined-name dependencies resolve outside the layer walk, so a
+            // name consumer's input change is not visible via `changed`; always
+            // re-evaluate it (named-range readers are rare). This keeps the gate
+            // correct without modelling the name dependency mechanism.
+            || self
+                .graph
+                .names_referenced_by(v)
+                .is_some_and(|names| !names.is_empty())
     }
 
     /// Gate decision for one layer vertex: evaluate iff it must always run or a
@@ -9376,6 +9422,9 @@ where
         // `has_edited`; direct-on-graph structural edits bump `structural_epoch`.
         self.has_edited = false;
         self.last_recalc_structural_epoch = self.graph.structural_epoch();
+        // Edited value inputs were consumed (seeded into this recalc's change
+        // set); reset so the next recalc only sees fresh edits.
+        self.edited_value_inputs.clear();
 
         Ok(EvalResult {
             computed_vertices,

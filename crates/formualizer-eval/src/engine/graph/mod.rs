@@ -3444,6 +3444,13 @@ impl DependencyGraph {
         self.structural_epoch
     }
 
+    /// Name vertices referenced by `vertex` (defined-name dependencies, tracked
+    /// separately from the `(vertex)` dependency edges). Used by the value-
+    /// change recalc gate to treat a changed named range as a changed input.
+    pub(crate) fn names_referenced_by(&self, vertex: VertexId) -> Option<&[VertexId]> {
+        self.vertex_to_names.get(&vertex).map(|v| v.as_slice())
+    }
+
     /// Whether any external data source (scalar or table) is registered. Source
     /// reads are version-invalidated outside the vertex dependency graph, so a
     /// source-reading formula can change value without any tracked dependency
