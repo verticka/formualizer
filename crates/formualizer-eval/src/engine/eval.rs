@@ -12677,8 +12677,22 @@ where
                     scratch.changed[i] = scratch.last_value[i] != circ_error;
                     scratch.last_value[i] = circ_error.clone();
                 } else {
+                    let value_changed = scratch.last_value[i] != value;
                     self.graph.update_vertex_value(m.vertex, value.clone());
-                    self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    // Skip the computed-overlay write when the value is
+                    // unchanged. The computed overlay is the value home in
+                    // canonical mode, and the invariant `overlay[i] ==
+                    // last_value[i]` is maintained across passes: `last_value`
+                    // starts at the snapshot (the current overlay value) and
+                    // the overlay is rewritten exactly when `last_value`
+                    // changes, so an unchanged value means the overlay already
+                    // holds it and the write is pure churn. This is the
+                    // dominant per-member commit cost on volatile-but-stable
+                    // workloads (a volatile guard re-dirties every member every
+                    // recalc, yet the resolved values never change).
+                    if value_changed {
+                        self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    }
                     // §7.14 invariant (G2): a formula member must never be
                     // shadowed by a user/delta overlay entry, or iteration
                     // reads would silently diverge from committed values.
@@ -12697,7 +12711,7 @@ where
                             cell.coord.col() + 1
                         );
                     }
-                    scratch.changed[i] = scratch.last_value[i] != value;
+                    scratch.changed[i] = value_changed;
                     scratch.last_value[i] = value;
                 }
             }};
