@@ -56,4 +56,4 @@ web-sys = "0.3.72"
 syn = "2.0"
 
 [patch.crates-io]
-umya-spreadsheet = { git = "https://github.com/PSU3D0/umya-spreadsheet.git", rev = "4b64d65daf19bba79800951cd38920d7eb95320c" }
+umya-spreadsheet = { git = "https://github.com/verticka/umya-spreadsheet", rev = "1b64aca9dd31172cacbd92cc2c5e8826e7005ff6" }

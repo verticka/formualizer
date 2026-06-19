@@ -63,42 +63,32 @@ both fail on stock umya and pass with the fix.
 
 On the formualizer side, `crates/formualizer-workbook/tests/umya/shared_formula_quoted_sheet.rs`
 loads `tests/fixtures/shared_formula_quoted_sheet.xlsx` end-to-end and asserts
-`Main!B2 = Main!B3 = "42-x"`, `Main!B4 = ""`. It is `#[ignore]`d because the
-default `[patch.crates-io]` umya (PSU3D0 2.3.2) is unpatched; run it with the
-patched umya pinned (below):
+`Main!B2 = Main!B3 = "42-x"`, `Main!B4 = ""`.
 
-```
-cargo test -p formualizer-workbook --features umya --test umya \
-  shared_formula_quoted_sheet -- --ignored
-```
-
-## Wiring the fix into formualizer (final step)
+## Wiring (done)
 
 formualizer pins `umya-spreadsheet = "=2.3.2"`, so the patched crate **must**
 keep version 2.3.2 — i.e. the fix has to sit on the PSU3D0 2.3.2 base
-(`4b64d65`), **not** on upstream umya 3.0.0. Push a 2.3.2-based branch carrying
-the patch to your fork:
-
-```sh
-git clone https://github.com/PSU3D0/umya-spreadsheet.git
-cd umya-spreadsheet
-git checkout -b fix/shared-formula-quoted-sheet-2.3.2 4b64d65
-git am < /path/to/formualizer/docs/umya-shared-formula-quoted-sheet.patch
-cargo test --lib shared_formula_quoted_sheet   # 2 tests pass
-git remote add verticka https://github.com/verticka/umya-spreadsheet.git
-git push verticka fix/shared-formula-quoted-sheet-2.3.2
-```
-
-Then point formualizer's `[patch.crates-io]` (in the workspace `Cargo.toml`) at
-that branch's commit and refresh the lock:
+(`4b64d65`), **not** on upstream umya 3.0.0 (which renames `Spreadsheet` ->
+`Workbook`, drops the typed `set_formula_result_*` setters formualizer relies
+on, and still carries this very bug). The fix is therefore the `4b64d65`
+PSU3D0 base + this patch, published in the `verticka/umya-spreadsheet` fork and
+pinned in the workspace `Cargo.toml`:
 
 ```toml
 [patch.crates-io]
-umya-spreadsheet = { git = "https://github.com/verticka/umya-spreadsheet.git", rev = "<pushed_commit_sha>" }
+umya-spreadsheet = { git = "https://github.com/verticka/umya-spreadsheet", rev = "1b64aca9dd31172cacbd92cc2c5e8826e7005ff6" }
 ```
 
+To reproduce that fork branch from scratch:
+
 ```sh
-cargo update umya-spreadsheet
-# remove the #[ignore] on loads_shared_formula_with_quoted_sheet_ref
-cargo test -p formualizer-workbook --features umya --test umya shared_formula_quoted_sheet
+git clone https://github.com/verticka/umya-spreadsheet.git
+cd umya-spreadsheet
+git remote add psu3d0 https://github.com/PSU3D0/umya-spreadsheet.git
+git fetch psu3d0 4b64d65daf19bba79800951cd38920d7eb95320c
+git checkout -b fix/shared-formula-quoted-sheet-2.3.2 4b64d65daf19bba79800951cd38920d7eb95320c
+git am < /path/to/formualizer/docs/umya-shared-formula-quoted-sheet.patch
+cargo test --lib shared_formula_quoted_sheet   # 2 tests pass
+git push origin fix/shared-formula-quoted-sheet-2.3.2
 ```

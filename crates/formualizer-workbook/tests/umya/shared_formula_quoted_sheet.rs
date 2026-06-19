@@ -18,12 +18,10 @@ fn fixture_path() -> std::path::PathBuf {
         .join("../../tests/fixtures/shared_formula_quoted_sheet.xlsx")
 }
 
-// Requires the patched umya-spreadsheet (the fix is not yet upstream). With
-// the default `[patch.crates-io]` (PSU3D0 2.3.2, unpatched) this loads the
-// shared member as an error instead of "42-x". Pin the patched umya (see
-// docs/umya-shared-formula-quoted-sheet.md) and run with `-- --ignored`.
+// Guards the umya-spreadsheet shared-formula quoted-sheet fix (pinned via the
+// workspace `[patch.crates-io]`). Without the fix, the shared member loads as
+// an error instead of "42-x"; see docs/umya-shared-formula-quoted-sheet.md.
 #[test]
-#[ignore = "needs patched umya-spreadsheet; see docs/umya-shared-formula-quoted-sheet.md"]
 fn loads_shared_formula_with_quoted_sheet_ref() {
     let path = fixture_path();
     assert!(path.exists(), "missing fixture: {}", path.display());
