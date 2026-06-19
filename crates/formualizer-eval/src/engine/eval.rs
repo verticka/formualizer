@@ -410,8 +410,27 @@ impl ComputedWriteChunkPlan {
 /// of phantom SCCs this is the dominant per-task fixed cost (RFC #112 Stage
 /// 2b). All buffers are cleared (capacity retained) at the start of each task;
 /// contents never carry meaning between tasks.
+/// One SCC member in evaluation order: its vertex plus, for cell members, the
+/// cell reference (name/other members carry `None`).
+pub(crate) struct SccMember {
+    vertex: VertexId,
+    cell: Option<CellRef>,
+}
+
 #[derive(Default)]
 pub(crate) struct SccScratch {
+    /// Cell members paired with their refs, before ordering.
+    cell_members: Vec<(VertexId, CellRef)>,
+    /// Name members paired with their folded keys, before ordering.
+    name_members: Vec<(VertexId, String)>,
+    /// Non-cell/non-name members (defensive; never evaluated).
+    other_members: Vec<VertexId>,
+    /// Ordered cell refs handed to the live-edge collector.
+    cell_refs: Vec<CellRef>,
+    /// Ordered folded name keys handed to the live-edge collector.
+    name_keys: Vec<String>,
+    /// Members in evaluation order (cells, then names, then others).
+    members: Vec<SccMember>,
     /// Pre-task value snapshot, one per member (spec §3 side-effect baseline).
     snapshot: Vec<LiteralValue>,
     /// Most recently committed value per member.
@@ -12461,11 +12480,6 @@ where
         mut delta: Option<&mut DeltaCollector>,
         cancel_flag: Option<&AtomicBool>,
     ) -> Result<usize, ExcelError> {
-        struct SccMember {
-            vertex: VertexId,
-            cell: Option<CellRef>,
-        }
-
         let task_start = crate::instant::FzInstant::now();
 
         // Borrow the engine's reusable SCC working buffers for this task. They
@@ -12473,14 +12487,26 @@ where
         // cancellation, which aborts the whole evaluation, so dropping the
         // scratch there is harmless (it reallocates if evaluation resumes).
         let mut scratch = std::mem::take(&mut self.scc_scratch);
+        // Take the member-classification Vecs out as locals so the ordering
+        // code below reads exactly as before; their allocations are reused
+        // across tasks and restored at the end.
+        let mut cell_members = std::mem::take(&mut scratch.cell_members);
+        let mut name_members = std::mem::take(&mut scratch.name_members);
+        let mut other_members = std::mem::take(&mut scratch.other_members);
+        let mut cell_refs = std::mem::take(&mut scratch.cell_refs);
+        let mut name_keys = std::mem::take(&mut scratch.name_keys);
+        let mut members = std::mem::take(&mut scratch.members);
+        cell_members.clear();
+        name_members.clear();
+        other_members.clear();
+        cell_refs.clear();
+        name_keys.clear();
+        members.clear();
 
         // ── 0. Member order (spec §7.13): cells ascending (sheet, row, col);
         // name vertices after, lexicographic by folded canonical name; any
         // other vertex kind (defensive — `get_evaluation_vertices` only emits
         // formula/name kinds) last by id, never evaluated.
-        let mut cell_members: Vec<(VertexId, CellRef)> = Vec::new();
-        let mut name_members: Vec<(VertexId, String)> = Vec::new();
-        let mut other_members: Vec<VertexId> = Vec::new();
         for &v in cycle {
             match self.graph.get_vertex_kind(v) {
                 VertexKind::FormulaScalar | VertexKind::FormulaArray => {
@@ -12502,9 +12528,9 @@ where
         name_members.sort_unstable_by(|(av, ak), (bv, bk)| ak.cmp(bk).then(av.cmp(bv)));
         other_members.sort_unstable();
 
-        let cell_refs: Vec<CellRef> = cell_members.iter().map(|(_, c)| *c).collect();
-        let name_keys: Vec<String> = name_members.iter().map(|(_, k)| k.clone()).collect();
-        let mut members: Vec<SccMember> = Vec::with_capacity(cycle.len());
+        cell_refs.extend(cell_members.iter().map(|(_, c)| *c));
+        name_keys.extend(name_members.iter().map(|(_, k)| k.clone()));
+        members.reserve(cycle.len());
         for (v, c) in &cell_members {
             members.push(SccMember {
                 vertex: *v,
@@ -13026,6 +13052,12 @@ where
         }
 
         // Return the working buffers to the engine for the next SCC task.
+        scratch.cell_members = cell_members;
+        scratch.name_members = name_members;
+        scratch.other_members = other_members;
+        scratch.cell_refs = cell_refs;
+        scratch.name_keys = name_keys;
+        scratch.members = members;
         self.scc_scratch = scratch;
 
         Ok(stamped)
